@@ -1,36 +1,61 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Stitch Estimator
 
-## Getting Started
+SaaS for embroidery stitch-count estimates. Upload artwork, preview it as stitches, save projects.
 
-First, run the development server:
+Built on Next.js 16 (App Router) + Supabase (auth + Postgres + storage) + Tailwind v4.
+
+## Quick start
+
+### 1. Install
+
+```bash
+npm install
+```
+
+### 2. Supabase setup
+
+Go to your Supabase project dashboard.
+
+**a. Run the schema.** Open the SQL editor and paste the contents of [`supabase/schema.sql`](./supabase/schema.sql). This creates:
+
+- `public.projects` table with per-user RLS
+- `art` storage bucket (private) with per-user folder policies
+
+**b. Confirm auth is enabled.** In **Authentication → Providers**, make sure **Email** is on. For dev, you may want to disable "Confirm email" under **Authentication → Sign In / Providers → Email** so signup-then-login works without a mail round-trip.
+
+### 3. Environment variables
+
+Copy `.env.local.example` to `.env.local` and fill in:
+
+- `NEXT_PUBLIC_SUPABASE_URL` — from Supabase → Settings → API
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY` — the publishable / anon key
+- `SUPABASE_SECRET_KEY` — the secret / service-role key (server-only)
+
+### 4. Run
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Deploy to Vercel
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Push to GitHub.
+2. Import the repo at [vercel.com/new](https://vercel.com/new).
+3. Add the three env vars from step 3 above in the Vercel project settings (Production + Preview).
+4. Deploy.
 
-## Learn More
+## Project layout
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```
+src/
+  app/
+    (auth)/               login + signup pages + server actions
+    app/                  authenticated area (dashboard + estimator)
+    page.tsx              marketing landing
+  lib/supabase/           browser, server, and proxy Supabase clients
+  proxy.ts                session refresh + route protection (was middleware.ts in Next ≤15)
+supabase/
+  schema.sql              DB + storage setup
+```

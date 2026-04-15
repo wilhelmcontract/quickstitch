@@ -17,6 +17,14 @@ type StitchStats = {
   uniqueColors: number;
 };
 
+type ColorBucket = {
+  key: string;
+  r: number;
+  g: number;
+  b: number;
+  count: number;
+};
+
 const DEFAULT_DENSITY = 100;
 const PREVIEW_SIZE = 640;
 
@@ -26,6 +34,8 @@ export function Estimator() {
   const [density, setDensity] = useState(DEFAULT_DENSITY);
   const [name, setName] = useState("");
   const [stats, setStats] = useState<StitchStats | null>(null);
+  const [colors, setColors] = useState<ColorBucket[]>([]);
+  const [excludedColors, setExcludedColors] = useState<Set<string>>(new Set());
   const [saveError, setSaveError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
 
@@ -66,11 +76,22 @@ export function Estimator() {
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.fillStyle = "#f4f4f5";
-    ctx.fillRect(0, 0, canvasW, canvasH);
+
+    const checkSize = 12;
+    for (let cy = 0; cy < canvasH; cy += checkSize) {
+      for (let cx = 0; cx < canvasW; cx += checkSize) {
+        const isDark =
+          (Math.floor(cx / checkSize) + Math.floor(cy / checkSize)) % 2 === 0;
+        ctx.fillStyle = isDark ? "#d4d4d8" : "#f4f4f5";
+        ctx.fillRect(cx, cy, checkSize, checkSize);
+      }
+    }
 
     let stitchCount = 0;
-    const colorBuckets = new Set<string>();
+    const bucketMap = new Map<
+      string,
+      { r: number; g: number; b: number; count: number }
+    >();
     ctx.lineCap = "round";
     ctx.lineWidth = Math.max(1, cellSize * 0.35);
 
@@ -83,36 +104,55 @@ export function Estimator() {
         const a = data[i + 3];
         if (a < 32) continue;
 
+        const key = `${r >> 5}-${g >> 5}-${b >> 5}`;
+        const bucket = bucketMap.get(key);
+        if (bucket) {
+          bucket.r += r;
+          bucket.g += g;
+          bucket.b += b;
+          bucket.count += 1;
+        } else {
+          bucketMap.set(key, { r, g, b, count: 1 });
+        }
+
+        if (excludedColors.has(key)) continue;
+
         const cx = x * cellSize;
         const cy = y * cellSize;
         ctx.strokeStyle = `rgb(${r},${g},${b})`;
         ctx.beginPath();
-        ctx.moveTo(cx + cellSize * 0.15, cy + cellSize * 0.15);
-        ctx.lineTo(cx + cellSize * 0.85, cy + cellSize * 0.85);
-        ctx.moveTo(cx + cellSize * 0.85, cy + cellSize * 0.15);
-        ctx.lineTo(cx + cellSize * 0.15, cy + cellSize * 0.85);
+        ctx.moveTo(cx + cellSize * 0.1, cy + cellSize * 0.5);
+        ctx.lineTo(cx + cellSize * 0.9, cy + cellSize * 0.5);
         ctx.stroke();
 
         stitchCount++;
-        colorBuckets.add(
-          `${r >> 5}-${g >> 5}-${b >> 5}`,
-        );
       }
     }
 
+    const bucketList: ColorBucket[] = Array.from(bucketMap.entries())
+      .map(([key, v]) => ({
+        key,
+        r: Math.round(v.r / v.count),
+        g: Math.round(v.g / v.count),
+        b: Math.round(v.b / v.count),
+        count: v.count,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    setColors(bucketList);
     setStats({
       stitchCount,
       gridW,
       gridH,
-      uniqueColors: colorBuckets.size,
+      uniqueColors: bucketList.filter((c) => !excludedColors.has(c.key)).length,
     });
-  }, [density]);
+  }, [density, excludedColors]);
 
   useEffect(() => {
     if (!previewUrl) return;
     const id = requestAnimationFrame(renderStitches);
     return () => cancelAnimationFrame(id);
-  }, [previewUrl, density, renderStitches]);
+  }, [previewUrl, density, excludedColors, renderStitches]);
 
   const estimatedMinutes = useMemo(() => {
     if (!stats) return null;
@@ -124,13 +164,28 @@ export function Estimator() {
     if (!f) return;
     setFile(f);
     setSaveError(null);
+    setExcludedColors(new Set());
     if (!name) setName(f.name.replace(/\.[^.]+$/, ""));
+  }
+
+  function toggleColor(key: string) {
+    setExcludedColors((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
   }
 
   function onDrop(e: React.DragEvent<HTMLDivElement>) {
     e.preventDefault();
     const f = e.dataTransfer.files?.[0];
-    if (f && f.type.startsWith("image/")) onFileSelected(f);
+    if (!f) return;
+    const isAccepted =
+      f.type === "image/png" ||
+      f.type === "image/jpeg" ||
+      /\.(png|jpe?g|dst)$/i.test(f.name);
+    if (isAccepted) onFileSelected(f);
   }
 
   function handleSave() {
@@ -166,7 +221,7 @@ export function Estimator() {
           >
             <p className="font-medium">Drop an image here</p>
             <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              or click to browse · PNG, JPG, SVG
+              or click to browse · PNG, JPG, DST
             </p>
           </div>
         ) : (
@@ -186,7 +241,7 @@ export function Estimator() {
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*"
+          accept=".dst,.jpg,.jpeg,.png,image/jpeg,image/png"
           className="hidden"
           onChange={(e) => onFileSelected(e.target.files?.[0] ?? null)}
         />
@@ -235,6 +290,41 @@ export function Estimator() {
             className="w-full"
           />
         </div>
+
+        {colors.length > 0 && (
+          <div className="mt-6">
+            <p className="text-sm font-medium">
+              Colors
+              <span className="ml-2 text-zinc-500">
+                click to exclude from estimate
+              </span>
+            </p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {colors.map((c) => {
+                const excluded = excludedColors.has(c.key);
+                return (
+                  <button
+                    key={c.key}
+                    type="button"
+                    onClick={() => toggleColor(c.key)}
+                    title={`rgb(${c.r}, ${c.g}, ${c.b}) · ${c.count} px`}
+                    className={`flex items-center gap-2 rounded-md border px-2 py-1 text-xs ${
+                      excluded
+                        ? "border-zinc-300 dark:border-zinc-700 bg-zinc-100 dark:bg-zinc-800 text-zinc-500 line-through"
+                        : "border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                    }`}
+                  >
+                    <span
+                      className="inline-block h-4 w-4 rounded-sm border border-zinc-300 dark:border-zinc-600"
+                      style={{ backgroundColor: `rgb(${c.r},${c.g},${c.b})` }}
+                    />
+                    <span>{c.count.toLocaleString()}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {stats && (
           <dl className="mt-6 grid grid-cols-3 gap-3 text-sm">

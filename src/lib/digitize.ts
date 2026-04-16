@@ -687,26 +687,32 @@ function generateAxisSatin(
   const thicknessMm = samples > 0 ? thicknessSum / samples : 0;
 
   const underlay: Stitch[] = [];
-  const stepPx = UNDERLAY_RUN_LEN_MM * pxPerMm;
-  if (thicknessMm <= NARROW_SATIN_THRESHOLD_MM) {
-    for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += stepPx) {
+
+  // Layer 1: edge-walk — running stitch along the center, 2mm spacing.
+  const edgeWalkStepPx = 2.0 * pxPerMm;
+  for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += edgeWalkStepPx) {
+    const { sMin, sMax } = perpAt(prof, t);
+    if (!isFinite(sMin) || !isFinite(sMax)) continue;
+    const sMid = (sMin + sMax) / 2;
+    const x = prof.cx + t * prof.cosA + sMid * -prof.sinA;
+    const y = prof.cy + t * prof.sinA + sMid * prof.cosA;
+    underlay.push(ptMm(x, y, pxPerMm));
+  }
+
+  // Layer 2 (wider satin only): zigzag — center→top→center→bottom pattern,
+  // advancing ~0.5mm per crossing along the axis.
+  if (thicknessMm > NARROW_SATIN_THRESHOLD_MM) {
+    const zigAdvancePx = 0.5 * pxPerMm;
+    let phase = 0;
+    for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += zigAdvancePx) {
       const { sMin, sMax } = perpAt(prof, t);
       if (!isFinite(sMin) || !isFinite(sMax)) continue;
       const sMid = (sMin + sMax) / 2;
-      const x = prof.cx + t * prof.cosA + sMid * -prof.sinA;
-      const y = prof.cy + t * prof.sinA + sMid * prof.cosA;
-      underlay.push(ptMm(x, y, pxPerMm));
-    }
-  } else {
-    let toggle = false;
-    for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += stepPx) {
-      const { sMin, sMax } = perpAt(prof, t);
-      if (!isFinite(sMin) || !isFinite(sMax)) continue;
-      const s = toggle ? sMax : sMin;
-      const px = prof.cx + t * prof.cosA;
-      const py = prof.cy + t * prof.sinA;
-      underlay.push(ptMm(px + s * -prof.sinA, py + s * prof.cosA, pxPerMm));
-      toggle = !toggle;
+      const s = phase === 0 ? sMid : phase === 1 ? sMax : phase === 2 ? sMid : sMin;
+      const px = prof.cx + t * prof.cosA + s * -prof.sinA;
+      const py = prof.cy + t * prof.sinA + s * prof.cosA;
+      underlay.push(ptMm(px, py, pxPerMm));
+      phase = (phase + 1) % 4;
     }
   }
 

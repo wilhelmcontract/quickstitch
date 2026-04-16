@@ -1,0 +1,1093 @@
+/**
+ * Quickie raster-to-stitch digitizer.
+ *
+ * Per color (after auto-clustering to a user-specified count and dropping
+ * near-white background): build a binary mask, run Zhang-Suen thinning to get
+ * a skeleton, label connected components, and classify each component by max
+ * thickness (running < 1 mm, satin 1-6 mm, > 6 mm split-or-fill).
+ *
+ * Satin and running follow the LOCAL skeleton tangent, so curved shapes
+ * (script lettering, swooshes) get stitches that follow the curve. Fill uses
+ * a straight scanline. Underlay first, then top stitches, both same color.
+ */
+
+export type DetectedColor = {
+  hex: string;
+  r: number;
+  g: number;
+  b: number;
+  pixelCount: number;
+};
+
+export type ColorPlan = {
+  hex: string;
+  r: number;
+  g: number;
+  b: number;
+  pixelCount: number;
+  excluded: boolean;
+  density: number;
+  pullCompMm: number;
+  splitWideSatin: boolean;
+};
+
+export type Stitch = { x: number; y: number };
+export type StitchType = "running" | "satin" | "fill";
+
+export type RegionPlan = {
+  colorIndex: number;
+  stitchType: StitchType;
+  underlay: Stitch[];
+  topStitches: Stitch[];
+};
+
+export type DigitizeResult = {
+  widthMm: number;
+  heightMm: number;
+  pxPerMm: number;
+  regions: RegionPlan[];
+  totalStitchCount: number;
+  perColorStitchCount: number[];
+};
+
+const DEFAULT_BG_BRIGHTNESS = 240;
+const DEFAULT_NUM_COLORS = 4;
+const COLOR_CANDIDATE_MULTIPLIER = 4;
+
+const RUN_STITCH_LEN_MM = 3.0;
+const SATIN_SPACING_MM = 0.4;
+const FILL_ROW_SPACING_MM = 0.4;
+const FILL_STITCH_LEN_MM = 1.3;
+const SATIN_LANE_WIDTH_MM = 5.0;
+const SATIN_MAX_THICKNESS_MM = 6.0;
+const RUNNING_MAX_THICKNESS_MM = 1.0;
+
+const UNDERLAY_RUN_LEN_MM = 1.5;
+const UNDERLAY_FILL_ROW_SPACING_MM = 2.0;
+const NARROW_SATIN_THRESHOLD_MM = 2.5;
+
+const MIN_COMPONENT_PX = 8;
+
+function rgbToHex(r: number, g: number, b: number): string {
+  return `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function isBackground(r: number, g: number, b: number, threshold: number) {
+  return r >= threshold && g >= threshold && b >= threshold;
+}
+
+type RGBSum = { r: number; g: number; b: number; count: number };
+
+function colorDist(a: RGBSum, b: RGBSum): number {
+  const dr = a.r - b.r;
+  const dg = a.g - b.g;
+  const db = a.b - b.b;
+  return dr * dr + dg * dg + db * db;
+}
+
+/**
+ * Quantize the image to N dominant colors. Starts from the top
+ * `N * COLOR_CANDIDATE_MULTIPLIER` 5-bit-per-channel buckets, then
+ * agglomeratively merges the closest pair until N remain.
+ */
+export function detectColors(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  options: { numColors?: number; bgThreshold?: number } = {},
+): DetectedColor[] {
+  const numColors = Math.max(1, options.numColors ?? DEFAULT_NUM_COLORS);
+  const bg = options.bgThreshold ?? DEFAULT_BG_BRIGHTNESS;
+
+  const counts = new Map<number, number>();
+  const sums = new Map<number, RGBSum>();
+
+  for (let i = 0; i < width * height; i++) {
+    const off = i * 4;
+    const a = data[off + 3];
+    if (a < 32) continue;
+    const r = data[off];
+    const g = data[off + 1];
+    const b = data[off + 2];
+    if (isBackground(r, g, b, bg)) continue;
+    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    const s = sums.get(key);
+    if (s) {
+      s.r += r;
+      s.g += g;
+      s.b += b;
+      s.count += 1;
+    } else {
+      sums.set(key, { r, g, b, count: 1 });
+    }
+  }
+
+  const candidates: RGBSum[] = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, numColors * COLOR_CANDIDATE_MULTIPLIER)
+    .map(([key]) => {
+      const s = sums.get(key);
+      if (!s) throw new Error(`detectColors: missing sum for key ${key}`);
+      return {
+        r: Math.round(s.r / s.count),
+        g: Math.round(s.g / s.count),
+        b: Math.round(s.b / s.count),
+        count: s.count,
+      };
+    });
+
+  while (candidates.length > numColors) {
+    let bestI = 0;
+    let bestJ = 1;
+    let bestDist = Infinity;
+    for (let i = 0; i < candidates.length; i++) {
+      for (let j = i + 1; j < candidates.length; j++) {
+        const d = colorDist(candidates[i], candidates[j]);
+        if (d < bestDist) {
+          bestDist = d;
+          bestI = i;
+          bestJ = j;
+        }
+      }
+    }
+    const a = candidates[bestI];
+    const b = candidates[bestJ];
+    const total = a.count + b.count;
+    candidates[bestI] = {
+      r: Math.round((a.r * a.count + b.r * b.count) / total),
+      g: Math.round((a.g * a.count + b.g * b.count) / total),
+      b: Math.round((a.b * a.count + b.b * b.count) / total),
+      count: total,
+    };
+    candidates.splice(bestJ, 1);
+  }
+
+  return candidates
+    .sort((a, b) => b.count - a.count)
+    .map((c) => ({
+      hex: rgbToHex(c.r, c.g, c.b),
+      r: c.r,
+      g: c.g,
+      b: c.b,
+      pixelCount: c.count,
+    }));
+}
+
+function buildMasks(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  colors: ColorPlan[],
+  bgThreshold: number,
+): Uint8Array[] {
+  const masks = colors.map(() => new Uint8Array(width * height));
+  for (let i = 0; i < width * height; i++) {
+    const off = i * 4;
+    const a = data[off + 3];
+    if (a < 32) continue;
+    const r = data[off];
+    const g = data[off + 1];
+    const b = data[off + 2];
+    if (isBackground(r, g, b, bgThreshold)) continue;
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let c = 0; c < colors.length; c++) {
+      if (colors[c].excluded) continue;
+      const dr = r - colors[c].r;
+      const dg = g - colors[c].g;
+      const db = b - colors[c].b;
+      const d = dr * dr + dg * dg + db * db;
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = c;
+      }
+    }
+    if (bestIdx >= 0) masks[bestIdx][i] = 1;
+  }
+  return masks;
+}
+
+/** Two-pass connected-components labeling with union-find (4-connectivity). */
+function connectedComponents(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+): { pixelsByLabel: number[][] } {
+  const labels = new Int32Array(width * height);
+  const parent: number[] = [0];
+  function find(x: number): number {
+    let r = x;
+    while (parent[r] !== r) r = parent[r];
+    while (parent[x] !== r) {
+      const next = parent[x];
+      parent[x] = r;
+      x = next;
+    }
+    return r;
+  }
+  function union(a: number, b: number) {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra === rb) return;
+    if (ra < rb) parent[rb] = ra;
+    else parent[ra] = rb;
+  }
+  let next = 1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (!mask[i]) continue;
+      const left = x > 0 && mask[i - 1] ? labels[i - 1] : 0;
+      const up = y > 0 && mask[i - width] ? labels[i - width] : 0;
+      if (left && up) {
+        labels[i] = Math.min(left, up);
+        union(left, up);
+      } else if (left) {
+        labels[i] = left;
+      } else if (up) {
+        labels[i] = up;
+      } else {
+        labels[i] = next;
+        parent.push(next);
+        next++;
+      }
+    }
+  }
+  const remap = new Map<number, number>();
+  const pixelsByLabel: number[][] = [];
+  for (let i = 0; i < width * height; i++) {
+    const l = labels[i];
+    if (!l) continue;
+    const root = find(l);
+    let nl = remap.get(root);
+    if (nl === undefined) {
+      nl = pixelsByLabel.length;
+      remap.set(root, nl);
+      pixelsByLabel.push([]);
+    }
+    pixelsByLabel[nl].push(i);
+  }
+  return { pixelsByLabel };
+}
+
+function distanceTransform(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+): Float32Array {
+  const dt = new Float32Array(width * height);
+  const SQRT2 = Math.SQRT2;
+  for (let i = 0; i < width * height; i++) dt[i] = mask[i] ? Infinity : 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (!mask[i]) continue;
+      let m = dt[i];
+      if (x > 0) m = Math.min(m, dt[i - 1] + 1);
+      if (y > 0) {
+        m = Math.min(m, dt[i - width] + 1);
+        if (x > 0) m = Math.min(m, dt[i - width - 1] + SQRT2);
+        if (x < width - 1) m = Math.min(m, dt[i - width + 1] + SQRT2);
+      }
+      dt[i] = m;
+    }
+  }
+  for (let y = height - 1; y >= 0; y--) {
+    for (let x = width - 1; x >= 0; x--) {
+      const i = y * width + x;
+      if (!mask[i]) continue;
+      let m = dt[i];
+      if (x < width - 1) m = Math.min(m, dt[i + 1] + 1);
+      if (y < height - 1) {
+        m = Math.min(m, dt[i + width] + 1);
+        if (x > 0) m = Math.min(m, dt[i + width - 1] + SQRT2);
+        if (x < width - 1) m = Math.min(m, dt[i + width + 1] + SQRT2);
+      }
+      dt[i] = m;
+    }
+  }
+  return dt;
+}
+
+/** Build a per-component mask from a list of pixel indices. */
+function maskFromPixels(
+  pixels: number[],
+  width: number,
+  height: number,
+): Uint8Array {
+  const m = new Uint8Array(width * height);
+  for (const i of pixels) m[i] = 1;
+  return m;
+}
+
+/**
+ * Build a cropped mask containing only the component, padded by 1 pixel.
+ * Returns the mask plus the (origin x, y) of the crop in the full image.
+ */
+function cropMaskOfComponent(
+  pixels: number[],
+  width: number,
+  height: number,
+): { mask: Uint8Array; cw: number; ch: number; cx: number; cy: number } {
+  let minX = width;
+  let maxX = -1;
+  let minY = height;
+  let maxY = -1;
+  for (const i of pixels) {
+    const x = i % width;
+    const y = (i - x) / width;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const cx = Math.max(0, minX - 1);
+  const cy = Math.max(0, minY - 1);
+  const cMaxX = Math.min(width - 1, maxX + 1);
+  const cMaxY = Math.min(height - 1, maxY + 1);
+  const cw = cMaxX - cx + 1;
+  const ch = cMaxY - cy + 1;
+  const mask = new Uint8Array(cw * ch);
+  for (const i of pixels) {
+    const x = i % width;
+    const y = (i - x) / width;
+    mask[(y - cy) * cw + (x - cx)] = 1;
+  }
+  return { mask, cw, ch, cx, cy };
+}
+
+/** Zhang-Suen thinning to a 1-pixel-wide skeleton. */
+function skeletonize(
+  src: Uint8Array,
+  width: number,
+  height: number,
+): Uint8Array {
+  const skel = new Uint8Array(src);
+  const toRemove: number[] = [];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let pass = 0; pass < 2; pass++) {
+      toRemove.length = 0;
+      for (let y = 1; y < height - 1; y++) {
+        for (let x = 1; x < width - 1; x++) {
+          const i = y * width + x;
+          if (!skel[i]) continue;
+          const p2 = skel[i - width];
+          const p3 = skel[i - width + 1];
+          const p4 = skel[i + 1];
+          const p5 = skel[i + width + 1];
+          const p6 = skel[i + width];
+          const p7 = skel[i + width - 1];
+          const p8 = skel[i - 1];
+          const p9 = skel[i - width - 1];
+          const B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+          if (B < 2 || B > 6) continue;
+          let A = 0;
+          if (p2 === 0 && p3 === 1) A++;
+          if (p3 === 0 && p4 === 1) A++;
+          if (p4 === 0 && p5 === 1) A++;
+          if (p5 === 0 && p6 === 1) A++;
+          if (p6 === 0 && p7 === 1) A++;
+          if (p7 === 0 && p8 === 1) A++;
+          if (p8 === 0 && p9 === 1) A++;
+          if (p9 === 0 && p2 === 1) A++;
+          if (A !== 1) continue;
+          if (pass === 0) {
+            if (p2 * p4 * p6 !== 0) continue;
+            if (p4 * p6 * p8 !== 0) continue;
+          } else {
+            if (p2 * p4 * p8 !== 0) continue;
+            if (p2 * p6 * p8 !== 0) continue;
+          }
+          toRemove.push(i);
+        }
+      }
+      for (const i of toRemove) {
+        skel[i] = 0;
+        changed = true;
+      }
+    }
+  }
+  return skel;
+}
+
+function neighborsOf(
+  skel: Uint8Array,
+  i: number,
+  width: number,
+  height: number,
+): number[] {
+  const x = i % width;
+  const y = (i - x) / width;
+  const out: number[] = [];
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+      const ni = ny * width + nx;
+      if (skel[ni]) out.push(ni);
+    }
+  }
+  return out;
+}
+
+/** Trace skeleton pixels into a list of polylines (in pixel coords). */
+function traceSkeleton(
+  skel: Uint8Array,
+  width: number,
+  height: number,
+): { x: number; y: number }[][] {
+  const visited = new Uint8Array(width * height);
+  const polylines: { x: number; y: number }[][] = [];
+
+  function tracePath(start: number) {
+    const path: { x: number; y: number }[] = [];
+    let cur = start;
+    let prev = -1;
+    while (!visited[cur]) {
+      visited[cur] = 1;
+      const xc = cur % width;
+      const yc = (cur - xc) / width;
+      path.push({ x: xc, y: yc });
+      const ns = neighborsOf(skel, cur, width, height).filter(
+        (n) => n !== prev && !visited[n],
+      );
+      if (ns.length === 0) break;
+      prev = cur;
+      cur = ns[0];
+    }
+    if (path.length >= 2) polylines.push(path);
+  }
+
+  for (let i = 0; i < width * height; i++) {
+    if (!skel[i] || visited[i]) continue;
+    if (neighborsOf(skel, i, width, height).length === 1) tracePath(i);
+  }
+  for (let i = 0; i < width * height; i++) {
+    if (!skel[i] || visited[i]) continue;
+    tracePath(i);
+  }
+  return polylines;
+}
+
+/** Cast a ray from (x,y) in direction (dx,dy) until it exits the mask; returns distance in pixels. */
+function castRay(
+  x: number,
+  y: number,
+  dx: number,
+  dy: number,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+): number {
+  const limit = Math.max(width, height);
+  let dist = 0;
+  while (dist < limit) {
+    dist += 0.5;
+    const ix = Math.round(x + dx * dist);
+    const iy = Math.round(y + dy * dist);
+    if (ix < 0 || ix >= width || iy < 0 || iy >= height) return dist - 0.5;
+    if (!mask[iy * width + ix]) return dist - 0.5;
+  }
+  return dist;
+}
+
+function ptMm(x: number, y: number, pxPerMm: number): Stitch {
+  return { x: x / pxPerMm, y: y / pxPerMm };
+}
+
+/** Build a polyline's cumulative arc-length table (pixels). */
+function polylineArcLength(poly: { x: number; y: number }[]): number[] {
+  const arc = [0];
+  for (let i = 1; i < poly.length; i++) {
+    const dx = poly[i].x - poly[i - 1].x;
+    const dy = poly[i].y - poly[i - 1].y;
+    arc.push(arc[i - 1] + Math.sqrt(dx * dx + dy * dy));
+  }
+  return arc;
+}
+
+type Sample = { x: number; y: number; tx: number; ty: number };
+
+/** Sample points along a polyline at fixed pixel intervals, with local tangent. */
+function sampleAlong(
+  poly: { x: number; y: number }[],
+  spacingPx: number,
+): Sample[] {
+  const arc = polylineArcLength(poly);
+  const total = arc[arc.length - 1];
+  const samples: Sample[] = [];
+  let cursor = 0;
+  let segIdx = 0;
+  while (cursor <= total + 1e-6) {
+    while (segIdx < poly.length - 1 && arc[segIdx + 1] < cursor) segIdx++;
+    if (segIdx >= poly.length - 1) break;
+    const t = (cursor - arc[segIdx]) / Math.max(1e-6, arc[segIdx + 1] - arc[segIdx]);
+    const x = poly[segIdx].x + t * (poly[segIdx + 1].x - poly[segIdx].x);
+    const y = poly[segIdx].y + t * (poly[segIdx + 1].y - poly[segIdx].y);
+    const tx = poly[segIdx + 1].x - poly[segIdx].x;
+    const ty = poly[segIdx + 1].y - poly[segIdx].y;
+    const tlen = Math.sqrt(tx * tx + ty * ty) || 1;
+    samples.push({ x, y, tx: tx / tlen, ty: ty / tlen });
+    cursor += spacingPx;
+  }
+  return samples;
+}
+
+function generateRunningFromSkeleton(
+  polylines: { x: number; y: number }[][],
+  pxPerMm: number,
+  density: number,
+): Stitch[] {
+  const stepPx = (RUN_STITCH_LEN_MM / Math.max(0.1, density)) * pxPerMm;
+  const out: Stitch[] = [];
+  for (const poly of polylines) {
+    const samples = sampleAlong(poly, stepPx);
+    for (const s of samples) out.push(ptMm(s.x, s.y, pxPerMm));
+  }
+  return out;
+}
+
+function generateCurvedSatin(
+  polylines: { x: number; y: number }[][],
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  pxPerMm: number,
+  density: number,
+  pullCompMm: number,
+): { underlay: Stitch[]; top: Stitch[] } {
+  const spacingPx = (SATIN_SPACING_MM / Math.max(0.1, density)) * pxPerMm;
+  const pullCompPx = pullCompMm * pxPerMm;
+  const underlayStepPx = UNDERLAY_RUN_LEN_MM * pxPerMm;
+  const top: Stitch[] = [];
+  const underlay: Stitch[] = [];
+
+  for (const poly of polylines) {
+    const samples = sampleAlong(poly, spacingPx);
+    if (samples.length === 0) continue;
+
+    let avgHalfThickPx = 0;
+    let avgN = 0;
+
+    // One stitch per sample (alternating edge); the renderer connects
+    // consecutive endpoints, drawing the zigzag back-and-forth that you see
+    // on a real satin stitch.
+    let toggle = false;
+    for (const s of samples) {
+      const px = -s.ty;
+      const py = s.tx;
+      const lo = castRay(s.x, s.y, -px, -py, mask, width, height);
+      const hi = castRay(s.x, s.y, px, py, mask, width, height);
+      avgHalfThickPx += (lo + hi) / 2;
+      avgN++;
+      const useHi = toggle;
+      const ex = useHi ? s.x + px * (hi + pullCompPx) : s.x - px * (lo + pullCompPx);
+      const ey = useHi ? s.y + py * (hi + pullCompPx) : s.y - py * (lo + pullCompPx);
+      top.push(ptMm(ex, ey, pxPerMm));
+      toggle = !toggle;
+    }
+
+    const halfThicknessMm = avgN > 0 ? avgHalfThickPx / avgN / pxPerMm : 0;
+    const thicknessMm = halfThicknessMm * 2;
+
+    // Underlay: center-run for narrow satin; edge-zigzag (left-right
+    // alternating along the skeleton) for wider satin.
+    const underSamples = sampleAlong(poly, underlayStepPx);
+    if (thicknessMm <= NARROW_SATIN_THRESHOLD_MM) {
+      for (const s of underSamples) underlay.push(ptMm(s.x, s.y, pxPerMm));
+    } else {
+      let toggle2 = false;
+      for (const s of underSamples) {
+        const px = -s.ty;
+        const py = s.tx;
+        const lo = castRay(s.x, s.y, -px, -py, mask, width, height);
+        const hi = castRay(s.x, s.y, px, py, mask, width, height);
+        const useHi = toggle2;
+        const ex = useHi ? s.x + px * hi : s.x - px * lo;
+        const ey = useHi ? s.y + py * hi : s.y - py * lo;
+        underlay.push(ptMm(ex, ey, pxPerMm));
+        toggle2 = !toggle2;
+      }
+    }
+  }
+
+  return { underlay, top };
+}
+
+function principalAngle(pixels: number[], width: number): number {
+  let sx = 0,
+    sy = 0;
+  for (const i of pixels) {
+    const x = i % width;
+    const y = (i - x) / width;
+    sx += x;
+    sy += y;
+  }
+  const mx = sx / pixels.length;
+  const my = sy / pixels.length;
+  let sxx = 0,
+    sxy = 0,
+    syy = 0;
+  for (const i of pixels) {
+    const x = i % width;
+    const y = (i - x) / width;
+    const dx = x - mx;
+    const dy = y - my;
+    sxx += dx * dx;
+    sxy += dx * dy;
+    syy += dy * dy;
+  }
+  return 0.5 * Math.atan2(2 * sxy, sxx - syy);
+}
+
+type AxisProfile = {
+  cx: number;
+  cy: number;
+  cosA: number;
+  sinA: number;
+  tMin: number;
+  tMax: number;
+  tStart: number;
+  sMinByT: Float32Array;
+  sMaxByT: Float32Array;
+};
+
+function buildAxisProfile(
+  pixels: number[],
+  width: number,
+  angle: number,
+): AxisProfile {
+  const cosA = Math.cos(angle);
+  const sinA = Math.sin(angle);
+  let sx = 0,
+    sy = 0;
+  for (const i of pixels) {
+    const x = i % width;
+    const y = (i - x) / width;
+    sx += x;
+    sy += y;
+  }
+  const cx = sx / pixels.length;
+  const cy = sy / pixels.length;
+
+  const tValues = new Float32Array(pixels.length);
+  const sValues = new Float32Array(pixels.length);
+  let tMin = Infinity;
+  let tMax = -Infinity;
+  for (let k = 0; k < pixels.length; k++) {
+    const i = pixels[k];
+    const x = i % width;
+    const y = (i - x) / width;
+    const dx = x - cx;
+    const dy = y - cy;
+    const t = dx * cosA + dy * sinA;
+    const s = -dx * sinA + dy * cosA;
+    tValues[k] = t;
+    sValues[k] = s;
+    if (t < tMin) tMin = t;
+    if (t > tMax) tMax = t;
+  }
+  const tStart = Math.floor(tMin);
+  const tEnd = Math.ceil(tMax);
+  const buckets = tEnd - tStart + 1;
+  const sMinByT = new Float32Array(buckets);
+  const sMaxByT = new Float32Array(buckets);
+  for (let b = 0; b < buckets; b++) {
+    sMinByT[b] = Infinity;
+    sMaxByT[b] = -Infinity;
+  }
+  for (let k = 0; k < pixels.length; k++) {
+    const b = Math.floor(tValues[k]) - tStart;
+    const s = sValues[k];
+    if (s < sMinByT[b]) sMinByT[b] = s;
+    if (s > sMaxByT[b]) sMaxByT[b] = s;
+  }
+  return { cx, cy, cosA, sinA, tMin, tMax, tStart, sMinByT, sMaxByT };
+}
+
+function perpAt(p: AxisProfile, t: number): { sMin: number; sMax: number } {
+  const b = Math.floor(t) - p.tStart;
+  if (b < 0 || b >= p.sMinByT.length) {
+    return { sMin: Infinity, sMax: -Infinity };
+  }
+  return { sMin: p.sMinByT[b], sMax: p.sMaxByT[b] };
+}
+
+function emitSatinLane(
+  prof: AxisProfile,
+  sLoFn: (t: number) => number,
+  sHiFn: (t: number) => number,
+  isValidT: (t: number) => boolean,
+  pxPerMm: number,
+  density: number,
+  pullCompPx: number,
+): Stitch[] {
+  const spacingPx = (SATIN_SPACING_MM / Math.max(0.1, density)) * pxPerMm;
+  const out: Stitch[] = [];
+  let toggle = false;
+  for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += spacingPx) {
+    if (!isValidT(t)) continue;
+    const sLo = sLoFn(t) - pullCompPx;
+    const sHi = sHiFn(t) + pullCompPx;
+    if (!isFinite(sLo) || !isFinite(sHi)) continue;
+    const px = prof.cx + t * prof.cosA;
+    const py = prof.cy + t * prof.sinA;
+    const a = ptMm(px + sLo * -prof.sinA, py + sLo * prof.cosA, pxPerMm);
+    const b = ptMm(px + sHi * -prof.sinA, py + sHi * prof.cosA, pxPerMm);
+    if (toggle) out.push(b, a);
+    else out.push(a, b);
+    toggle = !toggle;
+  }
+  return out;
+}
+
+function generateSplitSatin(
+  pixels: number[],
+  width: number,
+  pxPerMm: number,
+  density: number,
+  pullCompMm: number,
+  laneWidthMm: number,
+): { underlay: Stitch[]; top: Stitch[] } {
+  const angle = principalAngle(pixels, width);
+  const prof = buildAxisProfile(pixels, width, angle);
+  const pullCompPx = pullCompMm * pxPerMm;
+
+  let sMinAll = Infinity;
+  let sMaxAll = -Infinity;
+  for (let b = 0; b < prof.sMinByT.length; b++) {
+    if (prof.sMinByT[b] < sMinAll) sMinAll = prof.sMinByT[b];
+    if (prof.sMaxByT[b] > sMaxAll) sMaxAll = prof.sMaxByT[b];
+  }
+  const totalThickPx = sMaxAll - sMinAll;
+  const totalThickMm = totalThickPx / pxPerMm;
+  const lanes = Math.max(2, Math.ceil(totalThickMm / laneWidthMm));
+  const lanePx = totalThickPx / lanes;
+
+  const top: Stitch[] = [];
+  const underlay: Stitch[] = [];
+
+  for (let li = 0; li < lanes; li++) {
+    const sLane0 = sMinAll + li * lanePx;
+    const sLane1 = sMinAll + (li + 1) * lanePx;
+    const sLoFn = (t: number) => Math.max(perpAt(prof, t).sMin, sLane0);
+    const sHiFn = (t: number) => Math.min(perpAt(prof, t).sMax, sLane1);
+    const isValidT = (t: number) => {
+      const { sMin, sMax } = perpAt(prof, t);
+      if (!isFinite(sMin) || !isFinite(sMax)) return false;
+      return sMin < sLane1 && sMax > sLane0;
+    };
+    top.push(
+      ...emitSatinLane(prof, sLoFn, sHiFn, isValidT, pxPerMm, density, pullCompPx),
+    );
+
+    const sMid = (sLane0 + sLane1) / 2;
+    const stepPx = UNDERLAY_RUN_LEN_MM * pxPerMm;
+    const forward: Stitch[] = [];
+    for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += stepPx) {
+      if (!isValidT(t)) continue;
+      const px = prof.cx + t * prof.cosA;
+      const py = prof.cy + t * prof.sinA;
+      forward.push(
+        ptMm(px + sMid * -prof.sinA, py + sMid * prof.cosA, pxPerMm),
+      );
+    }
+    underlay.push(...forward);
+  }
+
+  return { underlay, top };
+}
+
+function generateFill(
+  pixels: number[],
+  width: number,
+  pxPerMm: number,
+  density: number,
+  pullCompMm: number,
+): { underlay: Stitch[]; top: Stitch[] } {
+  const angle = principalAngle(pixels, width);
+  const prof = buildAxisProfile(pixels, width, angle);
+  const pullCompPx = pullCompMm * pxPerMm;
+
+  const rowSpacingPx = (FILL_ROW_SPACING_MM / Math.max(0.1, density)) * pxPerMm;
+  const stitchLenPx = FILL_STITCH_LEN_MM * pxPerMm;
+
+  const top: Stitch[] = [];
+  let rowIdx = 0;
+  for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += rowSpacingPx) {
+    const { sMin, sMax } = perpAt(prof, t);
+    if (!isFinite(sMin) || !isFinite(sMax)) {
+      rowIdx++;
+      continue;
+    }
+    const sStart = sMin - pullCompPx;
+    const sEnd = sMax + pullCompPx;
+    const offset = (rowIdx % 2) * (stitchLenPx / 2);
+    const reverse = rowIdx % 2 === 1;
+    if (reverse) {
+      for (let s = sEnd - offset; s >= sStart - 1e-6; s -= stitchLenPx) {
+        const px = prof.cx + t * prof.cosA + s * -prof.sinA;
+        const py = prof.cy + t * prof.sinA + s * prof.cosA;
+        top.push(ptMm(px, py, pxPerMm));
+      }
+    } else {
+      for (let s = sStart + offset; s <= sEnd + 1e-6; s += stitchLenPx) {
+        const px = prof.cx + t * prof.cosA + s * -prof.sinA;
+        const py = prof.cy + t * prof.sinA + s * prof.cosA;
+        top.push(ptMm(px, py, pxPerMm));
+      }
+    }
+    rowIdx++;
+  }
+
+  // Grid underlay: parallel rows perpendicular to the top fill direction.
+  const underlay: Stitch[] = [];
+  const underlayRowPx = UNDERLAY_FILL_ROW_SPACING_MM * pxPerMm;
+  const profU = buildAxisProfile(pixels, width, angle + Math.PI / 2);
+  for (let t = profU.tMin; t <= profU.tMax + 1e-6; t += underlayRowPx) {
+    const { sMin, sMax } = perpAt(profU, t);
+    if (!isFinite(sMin) || !isFinite(sMax)) continue;
+    const startX = profU.cx + t * profU.cosA + sMin * -profU.sinA;
+    const startY = profU.cy + t * profU.sinA + sMin * profU.cosA;
+    const endX = profU.cx + t * profU.cosA + sMax * -profU.sinA;
+    const endY = profU.cy + t * profU.sinA + sMax * profU.cosA;
+    underlay.push(ptMm(startX, startY, pxPerMm));
+    underlay.push(ptMm(endX, endY, pxPerMm));
+  }
+
+  return { underlay, top };
+}
+
+function classifyByThickness(
+  maxThicknessMm: number,
+  splitWideSatin: boolean,
+): StitchType | "split-satin" {
+  if (maxThicknessMm < RUNNING_MAX_THICKNESS_MM) return "running";
+  if (maxThicknessMm <= SATIN_MAX_THICKNESS_MM) return "satin";
+  return splitWideSatin ? "split-satin" : "fill";
+}
+
+export function digitize(
+  imageData: { data: Uint8ClampedArray; width: number; height: number },
+  designWidthMm: number,
+  colors: ColorPlan[],
+  options: { bgThreshold?: number } = {},
+): DigitizeResult {
+  const { data, width, height } = imageData;
+  const bg = options.bgThreshold ?? DEFAULT_BG_BRIGHTNESS;
+  const masks = buildMasks(data, width, height, colors, bg);
+
+  let bMinX = width;
+  let bMaxX = -1;
+  let bMinY = height;
+  let bMaxY = -1;
+  for (let ci = 0; ci < colors.length; ci++) {
+    if (colors[ci].excluded) continue;
+    const m = masks[ci];
+    for (let i = 0; i < width * height; i++) {
+      if (!m[i]) continue;
+      const x = i % width;
+      const y = (i - x) / width;
+      if (x < bMinX) bMinX = x;
+      if (x > bMaxX) bMaxX = x;
+      if (y < bMinY) bMinY = y;
+      if (y > bMaxY) bMaxY = y;
+    }
+  }
+  if (bMaxX < 0) {
+    return {
+      widthMm: 0,
+      heightMm: 0,
+      pxPerMm: 0,
+      regions: [],
+      totalStitchCount: 0,
+      perColorStitchCount: new Array<number>(colors.length).fill(0),
+    };
+  }
+  const bboxWPx = bMaxX - bMinX + 1;
+  const bboxHPx = bMaxY - bMinY + 1;
+  const pxPerMm = bboxWPx / designWidthMm;
+  const heightMm = bboxHPx / pxPerMm;
+  const offsetXMm = bMinX / pxPerMm;
+  const offsetYMm = bMinY / pxPerMm;
+
+  const regions: RegionPlan[] = [];
+  const perColorStitchCount = new Array<number>(colors.length).fill(0);
+  let total = 0;
+
+  for (let ci = 0; ci < colors.length; ci++) {
+    const color = colors[ci];
+    if (color.excluded) continue;
+    const dt = distanceTransform(masks[ci], width, height);
+    const { pixelsByLabel } = connectedComponents(masks[ci], width, height);
+    for (const pixels of pixelsByLabel) {
+      if (pixels.length < MIN_COMPONENT_PX) continue;
+
+      let maxD = 0;
+      for (const i of pixels) if (dt[i] > maxD) maxD = dt[i];
+      const maxThicknessMm = (maxD * 2) / pxPerMm;
+      const type = classifyByThickness(maxThicknessMm, color.splitWideSatin);
+
+      let underlay: Stitch[] = [];
+      let top: Stitch[] = [];
+      let stitchType: StitchType;
+
+      if (type === "running" || type === "satin") {
+        const crop = cropMaskOfComponent(pixels, width, height);
+        const cropSkel = skeletonize(crop.mask, crop.cw, crop.ch);
+        const localPolys = traceSkeleton(cropSkel, crop.cw, crop.ch);
+        const polylines = localPolys.map((poly) =>
+          poly.map((p) => ({ x: p.x + crop.cx, y: p.y + crop.cy })),
+        );
+
+        if (type === "running") {
+          top = generateRunningFromSkeleton(polylines, pxPerMm, color.density);
+          stitchType = "running";
+        } else {
+          const componentMask = maskFromPixels(pixels, width, height);
+          const r = generateCurvedSatin(
+            polylines,
+            componentMask,
+            width,
+            height,
+            pxPerMm,
+            color.density,
+            color.pullCompMm,
+          );
+          underlay = r.underlay;
+          top = r.top;
+          stitchType = "satin";
+        }
+      } else if (type === "split-satin") {
+        const r = generateSplitSatin(
+          pixels,
+          width,
+          pxPerMm,
+          color.density,
+          color.pullCompMm,
+          SATIN_LANE_WIDTH_MM,
+        );
+        underlay = r.underlay;
+        top = r.top;
+        stitchType = "satin";
+      } else {
+        const r = generateFill(
+          pixels,
+          width,
+          pxPerMm,
+          color.density,
+          color.pullCompMm,
+        );
+        underlay = r.underlay;
+        top = r.top;
+        stitchType = "fill";
+      }
+
+      for (const s of underlay) {
+        s.x -= offsetXMm;
+        s.y -= offsetYMm;
+      }
+      for (const s of top) {
+        s.x -= offsetXMm;
+        s.y -= offsetYMm;
+      }
+
+      const count = underlay.length + top.length;
+      total += count;
+      perColorStitchCount[ci] += count;
+      regions.push({ colorIndex: ci, stitchType, underlay, topStitches: top });
+    }
+  }
+
+  return {
+    widthMm: designWidthMm,
+    heightMm,
+    pxPerMm,
+    regions,
+    totalStitchCount: total,
+    perColorStitchCount,
+  };
+}
+
+export function renderDigitizedToCanvas(
+  result: DigitizeResult,
+  colors: ColorPlan[],
+  canvas: HTMLCanvasElement,
+  drawStitch: (
+    ctx: CanvasRenderingContext2D,
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+    color: string,
+    threadWidth?: number,
+    lightAngle?: number,
+  ) => void,
+  displayPxPerMm: number,
+): void {
+  const padding = 16;
+  canvas.width = Math.max(
+    100,
+    Math.round(result.widthMm * displayPxPerMm + padding * 2),
+  );
+  canvas.height = Math.max(
+    100,
+    Math.round(result.heightMm * displayPxPerMm + padding * 2),
+  );
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const checkSize = 12;
+  for (let cy = 0; cy < canvas.height; cy += checkSize) {
+    for (let cx = 0; cx < canvas.width; cx += checkSize) {
+      const isDark =
+        (Math.floor(cx / checkSize) + Math.floor(cy / checkSize)) % 2 === 0;
+      ctx.fillStyle = isDark ? "#d4d4d8" : "#f4f4f5";
+      ctx.fillRect(cx, cy, checkSize, checkSize);
+    }
+  }
+
+  const tx = (xMm: number) => xMm * displayPxPerMm + padding;
+  const ty = (yMm: number) => yMm * displayPxPerMm + padding;
+  const underlayThread = displayPxPerMm * 0.18;
+  const topThread = displayPxPerMm * 0.22;
+
+  for (const region of result.regions) {
+    const color = colors[region.colorIndex];
+    if (!color || color.excluded) continue;
+    drawSequence(ctx, region.underlay, color.hex, underlayThread, tx, ty, drawStitch);
+    drawSequence(ctx, region.topStitches, color.hex, topThread, tx, ty, drawStitch);
+  }
+}
+
+function drawSequence(
+  ctx: CanvasRenderingContext2D,
+  stitches: Stitch[],
+  hex: string,
+  threadWidth: number,
+  tx: (m: number) => number,
+  ty: (m: number) => number,
+  drawStitch: (
+    ctx: CanvasRenderingContext2D,
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+    color: string,
+    threadWidth?: number,
+    lightAngle?: number,
+  ) => void,
+) {
+  for (let i = 1; i < stitches.length; i++) {
+    const a = stitches[i - 1];
+    const b = stitches[i];
+    drawStitch(ctx, tx(a.x), ty(a.y), tx(b.x), ty(b.y), hex, threadWidth);
+  }
+}

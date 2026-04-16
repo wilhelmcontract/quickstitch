@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -15,21 +14,21 @@ import {
   drawRealisticStitch,
   type DstParseResult,
 } from "@/lib/dstParser";
+import {
+  detectColors,
+  digitize,
+  renderDigitizedToCanvas,
+  type ColorPlan,
+  type DigitizeResult,
+} from "@/lib/digitize";
 
-type ImageBucket = {
-  key: string;
-  r: number;
-  g: number;
-  b: number;
-  count: number;
-};
+type FileKind = "image" | "dst";
 
 type ImageStats = {
   kind: "image";
   stitchCount: number;
-  gridW: number;
-  gridH: number;
-  uniqueColors: number;
+  widthInches: number;
+  heightInches: number;
 };
 
 type DstStats = {
@@ -41,13 +40,35 @@ type DstStats = {
 
 type Stats = ImageStats | DstStats;
 
-type FileKind = "image" | "dst";
+type RgbaImage = {
+  data: Uint8ClampedArray;
+  width: number;
+  height: number;
+};
 
-const DEFAULT_DENSITY = 100;
-const PREVIEW_SIZE = 640;
+const DEFAULT_DESIGN_WIDTH_IN = 4;
+const DEFAULT_NUM_COLORS = 4;
+const MM_PER_INCH = 25.4;
+const DISPLAY_PX_PER_MM = 8;
 
 function detectKind(f: File): FileKind {
   return /\.dst$/i.test(f.name) ? "dst" : "image";
+}
+
+function defaultColorPlan(c: {
+  hex: string;
+  r: number;
+  g: number;
+  b: number;
+  pixelCount: number;
+}): ColorPlan {
+  return {
+    ...c,
+    excluded: false,
+    density: 1.0,
+    pullCompMm: 0.2,
+    splitWideSatin: true,
+  };
 }
 
 export function Estimator() {
@@ -56,18 +77,19 @@ export function Estimator() {
   const [parsedDst, setParsedDst] = useState<DstParseResult | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
 
-  const [density, setDensity] = useState(DEFAULT_DENSITY);
-  const [name, setName] = useState("");
-  const [imageStats, setImageStats] = useState<ImageStats | null>(null);
-
-  const [imageBuckets, setImageBuckets] = useState<ImageBucket[]>([]);
-  const [excludedBuckets, setExcludedBuckets] = useState<Set<string>>(
+  const [designWidthIn, setDesignWidthIn] = useState(DEFAULT_DESIGN_WIDTH_IN);
+  const [numColors, setNumColors] = useState(DEFAULT_NUM_COLORS);
+  const [imageRgba, setImageRgba] = useState<RgbaImage | null>(null);
+  const [colorPlans, setColorPlans] = useState<ColorPlan[]>([]);
+  const [selectedForMerge, setSelectedForMerge] = useState<Set<number>>(
     new Set(),
   );
+
   const [excludedDstStops, setExcludedDstStops] = useState<Set<number>>(
     new Set(),
   );
 
+  const [name, setName] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
 
@@ -86,117 +108,100 @@ export function Estimator() {
     return () => URL.revokeObjectURL(imageUrl);
   }, [imageUrl]);
 
-  const renderImageStitches = useCallback(() => {
+  function onImageLoaded() {
     const img = imgRef.current;
-    const canvas = stitchCanvasRef.current;
-    if (!img || !canvas || !img.complete || img.naturalWidth === 0) return;
-
-    const aspect = img.naturalWidth / img.naturalHeight;
-    const gridW = density;
-    const gridH = Math.max(1, Math.round(density / aspect));
-
-    const cellSize = Math.max(
-      2,
-      Math.floor(PREVIEW_SIZE / Math.max(gridW, gridH)),
-    );
-    const canvasW = gridW * cellSize;
-    const canvasH = gridH * cellSize;
-
-    canvas.width = canvasW;
-    canvas.height = canvasH;
-
-    const sampleCanvas = document.createElement("canvas");
-    sampleCanvas.width = gridW;
-    sampleCanvas.height = gridH;
-    const sampleCtx = sampleCanvas.getContext("2d", {
-      willReadFrequently: true,
-    });
-    if (!sampleCtx) return;
-    sampleCtx.drawImage(img, 0, 0, gridW, gridH);
-    const { data } = sampleCtx.getImageData(0, 0, gridW, gridH);
-
-    const ctx = canvas.getContext("2d");
+    if (!img || !img.complete || img.naturalWidth === 0) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
+    ctx.drawImage(img, 0, 0);
+    const id = ctx.getImageData(0, 0, img.naturalWidth, img.naturalHeight);
+    const rgba = { data: id.data, width: id.width, height: id.height };
+    setImageRgba(rgba);
+    runDetect(rgba, numColors);
+  }
 
-    const checkSize = 12;
-    for (let cy = 0; cy < canvasH; cy += checkSize) {
-      for (let cx = 0; cx < canvasW; cx += checkSize) {
-        const isDark =
-          (Math.floor(cx / checkSize) + Math.floor(cy / checkSize)) % 2 === 0;
-        ctx.fillStyle = isDark ? "#d4d4d8" : "#f4f4f5";
-        ctx.fillRect(cx, cy, checkSize, checkSize);
-      }
-    }
-
-    let stitchCount = 0;
-    const bucketMap = new Map<
-      string,
-      { r: number; g: number; b: number; count: number }
-    >();
-    const threadWidth = Math.max(1.5, cellSize * 0.6);
-
-    for (let y = 0; y < gridH; y++) {
-      for (let x = 0; x < gridW; x++) {
-        const i = (y * gridW + x) * 4;
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-        const a = data[i + 3];
-        if (a < 32) continue;
-
-        const key = `${r >> 5}-${g >> 5}-${b >> 5}`;
-        const bucket = bucketMap.get(key);
-        if (bucket) {
-          bucket.r += r;
-          bucket.g += g;
-          bucket.b += b;
-          bucket.count += 1;
-        } else {
-          bucketMap.set(key, { r, g, b, count: 1 });
-        }
-
-        if (excludedBuckets.has(key)) continue;
-
-        const cx = x * cellSize;
-        const cy = y * cellSize;
-        const x1 = cx + cellSize * 0.1;
-        const ymid = cy + cellSize * 0.5;
-        const x2 = cx + cellSize * 0.9;
-        const hex = `#${[r, g, b]
-          .map((v) => v.toString(16).padStart(2, "0"))
-          .join("")}`;
-        drawRealisticStitch(ctx, x1, ymid, x2, ymid, hex, threadWidth);
-        stitchCount++;
-      }
-    }
-
-    const bucketList: ImageBucket[] = Array.from(bucketMap.entries())
-      .map(([key, v]) => ({
-        key,
-        r: Math.round(v.r / v.count),
-        g: Math.round(v.g / v.count),
-        b: Math.round(v.b / v.count),
-        count: v.count,
-      }))
-      .sort((a, b) => b.count - a.count);
-
-    setImageBuckets(bucketList);
-    setImageStats({
-      kind: "image",
-      stitchCount,
-      gridW,
-      gridH,
-      uniqueColors: bucketList.filter((c) => !excludedBuckets.has(c.key))
-        .length,
+  function runDetect(rgba: RgbaImage, n: number) {
+    const detected = detectColors(rgba.data, rgba.width, rgba.height, {
+      numColors: n,
     });
-  }, [density, excludedBuckets]);
+    setColorPlans(detected.map(defaultColorPlan));
+    setSelectedForMerge(new Set());
+  }
 
+  function onNumColorsChange(n: number) {
+    setNumColors(n);
+    if (imageRgba) runDetect(imageRgba, n);
+  }
+
+  function combineSelected() {
+    if (selectedForMerge.size < 2) return;
+    const idx = Array.from(selectedForMerge).sort((a, b) => a - b);
+    const keep = idx[0];
+    const drop = new Set(idx.slice(1));
+    setColorPlans((prev) => {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let total = 0;
+      for (const i of idx) {
+        const c = prev[i];
+        r += c.r * c.pixelCount;
+        g += c.g * c.pixelCount;
+        b += c.b * c.pixelCount;
+        total += c.pixelCount;
+      }
+      const mr = Math.round(r / total);
+      const mg = Math.round(g / total);
+      const mb = Math.round(b / total);
+      const hex = `#${[mr, mg, mb].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+      const merged: ColorPlan = {
+        ...prev[keep],
+        hex,
+        r: mr,
+        g: mg,
+        b: mb,
+        pixelCount: total,
+      };
+      return prev
+        .map((c, i) => (i === keep ? merged : c))
+        .filter((_, i) => !drop.has(i));
+    });
+    setSelectedForMerge(new Set());
+  }
+
+  function toggleMergeSelection(i: number) {
+    setSelectedForMerge((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  }
+
+  const digitized = useMemo<DigitizeResult | null>(() => {
+    if (kind !== "image" || !imageRgba || colorPlans.length === 0) return null;
+    const widthMm = designWidthIn * MM_PER_INCH;
+    return digitize(imageRgba, widthMm, colorPlans);
+  }, [kind, imageRgba, colorPlans, designWidthIn]);
+
+  // Render the digitized result to the stitch canvas.
   useEffect(() => {
-    if (kind !== "image" || !imageUrl) return;
-    const id = requestAnimationFrame(renderImageStitches);
-    return () => cancelAnimationFrame(id);
-  }, [kind, imageUrl, density, excludedBuckets, renderImageStitches]);
+    if (kind !== "image" || !digitized) return;
+    const canvas = stitchCanvasRef.current;
+    if (!canvas) return;
+    renderDigitizedToCanvas(
+      digitized,
+      colorPlans,
+      canvas,
+      drawRealisticStitch,
+      DISPLAY_PX_PER_MM,
+    );
+  }, [kind, digitized, colorPlans]);
 
+  // DST: per-color-stop normal-stitch counts.
   const normalCountsByStop = useMemo<number[]>(() => {
     if (!parsedDst) return [];
     const counts = new Array<number>(parsedDst.colorStops.length).fill(0);
@@ -226,6 +231,19 @@ export function Estimator() {
     };
   }, [kind, parsedDst, excludedDstStops, normalCountsByStop]);
 
+  const imageStats = useMemo<ImageStats | null>(() => {
+    if (kind !== "image" || !digitized) return null;
+    return {
+      kind: "image",
+      stitchCount: digitized.totalStitchCount,
+      widthInches: digitized.widthMm / MM_PER_INCH,
+      heightInches: digitized.heightMm / MM_PER_INCH,
+    };
+  }, [kind, digitized]);
+
+  const stats: Stats | null = kind === "dst" ? dstStats : imageStats;
+
+  // Render the DST stitch preview when parsed/exclusions change.
   useEffect(() => {
     if (kind !== "dst" || !parsedDst) return;
     const canvas = stitchCanvasRef.current;
@@ -238,8 +256,7 @@ export function Estimator() {
     });
   }, [kind, parsedDst, excludedDstStops]);
 
-  const stats: Stats | null = kind === "dst" ? dstStats : imageStats;
-
+  // Render the DST original art preview once when parsed.
   useEffect(() => {
     if (kind !== "dst" || !parsedDst) return;
     const canvas = originalDstCanvasRef.current;
@@ -262,10 +279,10 @@ export function Estimator() {
     setKind(k);
     setSaveError(null);
     setParseError(null);
-    setExcludedBuckets(new Set());
     setExcludedDstStops(new Set());
-    setImageStats(null);
-    setImageBuckets([]);
+    setImageRgba(null);
+    setColorPlans([]);
+    setSelectedForMerge(new Set());
     setParsedDst(null);
     if (!name) setName(f.name.replace(/\.[^.]+$/, ""));
 
@@ -273,19 +290,17 @@ export function Estimator() {
       parseDstFromFile(f)
         .then(setParsedDst)
         .catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : "Could not parse DST file";
+          const msg =
+            err instanceof Error ? err.message : "Could not parse DST file";
           setParseError(msg);
         });
     }
   }
 
-  function toggleImageBucket(key: string) {
-    setExcludedBuckets((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+  function updateColorPlan(idx: number, patch: Partial<ColorPlan>) {
+    setColorPlans((prev) =>
+      prev.map((c, i) => (i === idx ? { ...c, ...patch } : c)),
+    );
   }
 
   function toggleDstStop(idx: number) {
@@ -315,16 +330,24 @@ export function Estimator() {
     fd.set("name", name || "Untitled");
     fd.set("art", file);
     fd.set("stitchCount", String(stats.stitchCount));
-    if (stats.kind === "image") {
-      fd.set("gridW", String(stats.gridW));
-      fd.set("gridH", String(stats.gridH));
-    }
 
     startTransition(async () => {
       const result = await saveProject(fd);
       if (result?.error) setSaveError(result.error);
     });
   }
+
+  // Original-art display size in CSS pixels: scale to chosen design width.
+  const originalDisplay = useMemo(() => {
+    if (kind !== "image" || !imageRgba) return null;
+    const aspect = imageRgba.width / imageRgba.height;
+    const widthMm = designWidthIn * MM_PER_INCH;
+    const heightMm = widthMm / aspect;
+    return {
+      widthPx: widthMm * DISPLAY_PX_PER_MM,
+      heightPx: heightMm * DISPLAY_PX_PER_MM,
+    };
+  }, [kind, imageRgba, designWidthIn]);
 
   return (
     <div className="grid gap-6 lg:grid-cols-2">
@@ -353,7 +376,15 @@ export function Estimator() {
                 ref={imgRef}
                 src={imageUrl}
                 alt="Uploaded artwork"
-                onLoad={renderImageStitches}
+                onLoad={onImageLoaded}
+                style={
+                  originalDisplay
+                    ? {
+                        width: `${originalDisplay.widthPx}px`,
+                        height: `${originalDisplay.heightPx}px`,
+                      }
+                    : undefined
+                }
                 className="max-h-[480px] max-w-full object-contain"
                 crossOrigin="anonymous"
               />
@@ -410,49 +441,56 @@ export function Estimator() {
         </div>
 
         {kind === "image" && (
-          <div className="mt-4 grid gap-2">
-            <label className="flex items-center justify-between text-sm">
-              <span className="font-medium">Stitch density</span>
-              <span className="text-zinc-500">{density} across</span>
+          <div className="mt-4 flex flex-wrap items-center gap-4">
+            <label className="flex items-center gap-2 text-sm">
+              <span className="font-medium">Design width</span>
+              <input
+                type="number"
+                min={0.5}
+                max={12}
+                step={0.1}
+                value={designWidthIn}
+                onChange={(e) => setDesignWidthIn(Number(e.target.value))}
+                className="h-9 w-20 rounded-md border border-zinc-300 dark:border-zinc-700 bg-transparent px-2"
+              />
+              <span className="text-zinc-500">inches</span>
             </label>
-            <input
-              type="range"
-              min={40}
-              max={240}
-              step={4}
-              value={density}
-              onChange={(e) => setDensity(Number(e.target.value))}
-              className="w-full"
-            />
+            <label className="flex items-center gap-2 text-sm">
+              <span className="font-medium"># colors</span>
+              <input
+                type="number"
+                min={1}
+                max={12}
+                step={1}
+                value={numColors}
+                onChange={(e) => onNumColorsChange(Number(e.target.value))}
+                className="h-9 w-16 rounded-md border border-zinc-300 dark:border-zinc-700 bg-transparent px-2"
+              />
+            </label>
           </div>
         )}
 
-        {kind === "image" && imageBuckets.length > 0 && (
-          <ColorList
-            entries={imageBuckets.map((c) => ({
-              key: c.key,
-              swatch: `rgb(${c.r},${c.g},${c.b})`,
-              label: c.count.toLocaleString(),
-              tooltip: `rgb(${c.r}, ${c.g}, ${c.b}) · ${c.count} px`,
-              excluded: excludedBuckets.has(c.key),
-              onToggle: () => toggleImageBucket(c.key),
-            }))}
+        {kind === "image" && colorPlans.length > 0 && (
+          <ImageColorList
+            plans={colorPlans}
+            onUpdate={updateColorPlan}
+            stitchCounts={digitized?.perColorStitchCount ?? []}
+            selected={selectedForMerge}
+            onToggleSelected={toggleMergeSelection}
+            onCombine={combineSelected}
           />
         )}
 
         {kind === "dst" && parsedDst && parsedDst.colorStops.length > 0 && (
-          <ColorList
-            entries={parsedDst.colorStops.map((s, idx) => {
-              const n = normalCountsByStop[idx];
-              return {
-                key: String(idx),
-                swatch: s.assignedThreadHex || s.defaultHex,
-                label: `Stop ${s.stopNumber} · ${n.toLocaleString()}`,
-                tooltip: `${s.assignedThreadHex || s.defaultHex} · ${n.toLocaleString()} stitches`,
-                excluded: excludedDstStops.has(idx),
-                onToggle: () => toggleDstStop(idx),
-              };
-            })}
+          <DstColorList
+            stops={parsedDst.colorStops.map((s, idx) => ({
+              key: String(idx),
+              swatch: s.assignedThreadHex || s.defaultHex,
+              label: `Stop ${s.stopNumber} · ${normalCountsByStop[idx].toLocaleString()}`,
+              tooltip: `${s.assignedThreadHex || s.defaultHex} · ${normalCountsByStop[idx].toLocaleString()} stitches`,
+              excluded: excludedDstStops.has(idx),
+              onToggle: () => toggleDstStop(idx),
+            }))}
           />
         )}
 
@@ -464,21 +502,12 @@ export function Estimator() {
                 {stats.stitchCount.toLocaleString()}
               </dd>
             </div>
-            {stats.kind === "image" ? (
-              <div className="rounded-md bg-zinc-100 dark:bg-zinc-800 p-3">
-                <dt className="text-zinc-500">Grid</dt>
-                <dd className="mt-1 text-lg font-semibold">
-                  {stats.gridW}×{stats.gridH}
-                </dd>
-              </div>
-            ) : (
-              <div className="rounded-md bg-zinc-100 dark:bg-zinc-800 p-3">
-                <dt className="text-zinc-500">Size</dt>
-                <dd className="mt-1 text-lg font-semibold">
-                  {stats.widthInches.toFixed(2)}″ × {stats.heightInches.toFixed(2)}″
-                </dd>
-              </div>
-            )}
+            <div className="rounded-md bg-zinc-100 dark:bg-zinc-800 p-3">
+              <dt className="text-zinc-500">Size</dt>
+              <dd className="mt-1 text-lg font-semibold">
+                {stats.widthInches.toFixed(2)}″ × {stats.heightInches.toFixed(2)}″
+              </dd>
+            </div>
             <div className="rounded-md bg-zinc-100 dark:bg-zinc-800 p-3">
               <dt className="text-zinc-500">~Run time</dt>
               <dd className="mt-1 text-lg font-semibold">
@@ -516,7 +545,128 @@ export function Estimator() {
   );
 }
 
-type ColorListEntry = {
+function ImageColorList({
+  plans,
+  onUpdate,
+  stitchCounts,
+  selected,
+  onToggleSelected,
+  onCombine,
+}: {
+  plans: ColorPlan[];
+  onUpdate: (idx: number, patch: Partial<ColorPlan>) => void;
+  stitchCounts: number[];
+  selected: Set<number>;
+  onToggleSelected: (idx: number) => void;
+  onCombine: () => void;
+}) {
+  return (
+    <div className="mt-6 space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-medium">Colors</p>
+        <button
+          type="button"
+          onClick={onCombine}
+          disabled={selected.size < 2}
+          className="rounded-md border border-zinc-300 dark:border-zinc-700 px-3 py-1 text-xs font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-40"
+        >
+          Combine selected ({selected.size})
+        </button>
+      </div>
+      {plans.map((c, idx) => (
+        <div
+          key={idx}
+          className={`rounded-md border p-3 ${
+            c.excluded
+              ? "border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50 opacity-60"
+              : selected.has(idx)
+                ? "border-blue-500 dark:border-blue-400 ring-1 ring-blue-500"
+                : "border-zinc-300 dark:border-zinc-700"
+          }`}
+        >
+          <div className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={selected.has(idx)}
+              onChange={() => onToggleSelected(idx)}
+              title="Select for combine"
+            />
+            <span
+              className="inline-block h-6 w-6 rounded-sm border border-zinc-300 dark:border-zinc-600"
+              style={{ backgroundColor: c.hex }}
+            />
+            <span className="text-sm font-mono">{c.hex}</span>
+            <span className="ml-auto text-xs text-zinc-500">
+              {stitchCounts[idx].toLocaleString()} stitches
+            </span>
+            <label className="flex items-center gap-1 text-xs">
+              <input
+                type="checkbox"
+                checked={c.excluded}
+                onChange={(e) => onUpdate(idx, { excluded: e.target.checked })}
+              />
+              Off
+            </label>
+          </div>
+          {!c.excluded && (
+            <div className="mt-3 grid gap-3 sm:grid-cols-3">
+              <label className="text-xs">
+                <div className="flex justify-between">
+                  <span>Density</span>
+                  <span className="text-zinc-500">
+                    {c.density.toFixed(2)}×
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0.5}
+                  max={2}
+                  step={0.05}
+                  value={c.density}
+                  onChange={(e) =>
+                    onUpdate(idx, { density: Number(e.target.value) })
+                  }
+                  className="mt-1 w-full"
+                />
+              </label>
+              <label className="text-xs">
+                <div className="flex justify-between">
+                  <span>Pull comp</span>
+                  <span className="text-zinc-500">
+                    {c.pullCompMm.toFixed(2)} mm
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={c.pullCompMm}
+                  onChange={(e) =>
+                    onUpdate(idx, { pullCompMm: Number(e.target.value) })
+                  }
+                  className="mt-1 w-full"
+                />
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={c.splitWideSatin}
+                  onChange={(e) =>
+                    onUpdate(idx, { splitWideSatin: e.target.checked })
+                  }
+                />
+                <span>Split wide satin (≥6mm)</span>
+              </label>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+type DstColorListEntry = {
   key: string;
   swatch: string;
   label: string;
@@ -525,7 +675,7 @@ type ColorListEntry = {
   onToggle: () => void;
 };
 
-function ColorList({ entries }: { entries: ColorListEntry[] }) {
+function DstColorList({ stops }: { stops: DstColorListEntry[] }) {
   return (
     <div className="mt-6">
       <p className="text-sm font-medium">
@@ -535,7 +685,7 @@ function ColorList({ entries }: { entries: ColorListEntry[] }) {
         </span>
       </p>
       <div className="mt-2 flex flex-wrap gap-2">
-        {entries.map((e) => (
+        {stops.map((e) => (
           <button
             key={e.key}
             type="button"

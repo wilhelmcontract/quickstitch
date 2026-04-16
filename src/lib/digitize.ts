@@ -57,7 +57,7 @@ const COLOR_CANDIDATE_MULTIPLIER = 4;
 const RUN_STITCH_LEN_MM = 3.0;
 const SATIN_SPACING_MM = 0.4;
 const FILL_ROW_SPACING_MM = 0.4;
-const FILL_STITCH_LEN_MM = 1.3;
+const FILL_STITCH_LEN_MM = 2.3;
 const SATIN_LANE_WIDTH_MM = 5.0;
 const SATIN_MAX_THICKNESS_MM = 6.0;
 const RUNNING_MAX_THICKNESS_MM = 1.0;
@@ -815,19 +815,23 @@ function generateFill(
     rowIdx++;
   }
 
-  // Grid underlay: rows perpendicular to the 55° fill direction.
+  // Zigzag underlay: back-and-forth across the region at ~10° (near
+  // perpendicular to the 55° fill). Each step advances along the underlay
+  // axis then crosses to the opposite edge, creating the zigzag.
   const underlay: Stitch[] = [];
+  const UNDERLAY_ANGLE_DEG = 10;
+  const underlayAngle = (UNDERLAY_ANGLE_DEG * Math.PI) / 180;
+  const profU = buildAxisProfile(pixels, width, underlayAngle);
   const underlayRowPx = UNDERLAY_FILL_ROW_SPACING_MM * pxPerMm;
-  const profU = buildAxisProfile(pixels, width, fillAngle + Math.PI / 2);
+  let zigToggle = false;
   for (let t = profU.tMin; t <= profU.tMax + 1e-6; t += underlayRowPx) {
     const { sMin, sMax } = perpAt(profU, t);
     if (!isFinite(sMin) || !isFinite(sMax)) continue;
-    const startX = profU.cx + t * profU.cosA + sMin * -profU.sinA;
-    const startY = profU.cy + t * profU.sinA + sMin * profU.cosA;
-    const endX = profU.cx + t * profU.cosA + sMax * -profU.sinA;
-    const endY = profU.cy + t * profU.sinA + sMax * profU.cosA;
-    underlay.push(ptMm(startX, startY, pxPerMm));
-    underlay.push(ptMm(endX, endY, pxPerMm));
+    const s = zigToggle ? sMax : sMin;
+    const px = profU.cx + t * profU.cosA + s * -profU.sinA;
+    const py = profU.cy + t * profU.sinA + s * profU.cosA;
+    underlay.push(ptMm(px, py, pxPerMm));
+    zigToggle = !zigToggle;
   }
 
   return { underlay, top };

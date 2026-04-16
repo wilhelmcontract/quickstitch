@@ -310,17 +310,6 @@ function distanceTransform(
   return dt;
 }
 
-/** Build a per-component mask from a list of pixel indices. */
-function maskFromPixels(
-  pixels: number[],
-  width: number,
-  height: number,
-): Uint8Array {
-  const m = new Uint8Array(width * height);
-  for (const i of pixels) m[i] = 1;
-  return m;
-}
-
 /**
  * Build a cropped mask containing only the component, padded by 1 pixel.
  * Returns the mask plus the (origin x, y) of the crop in the full image.
@@ -475,27 +464,6 @@ function traceSkeleton(
 }
 
 /** Cast a ray from (x,y) in direction (dx,dy) until it exits the mask; returns distance in pixels. */
-function castRay(
-  x: number,
-  y: number,
-  dx: number,
-  dy: number,
-  mask: Uint8Array,
-  width: number,
-  height: number,
-): number {
-  const limit = Math.max(width, height);
-  let dist = 0;
-  while (dist < limit) {
-    dist += 0.5;
-    const ix = Math.round(x + dx * dist);
-    const iy = Math.round(y + dy * dist);
-    if (ix < 0 || ix >= width || iy < 0 || iy >= height) return dist - 0.5;
-    if (!mask[iy * width + ix]) return dist - 0.5;
-  }
-  return dist;
-}
-
 function ptMm(x: number, y: number, pxPerMm: number): Stitch {
   return { x: x / pxPerMm, y: y / pxPerMm };
 }
@@ -550,73 +518,6 @@ function generateRunningFromSkeleton(
     for (const s of samples) out.push(ptMm(s.x, s.y, pxPerMm));
   }
   return out;
-}
-
-function generateCurvedSatin(
-  polylines: { x: number; y: number }[][],
-  mask: Uint8Array,
-  width: number,
-  height: number,
-  pxPerMm: number,
-  density: number,
-  pullCompMm: number,
-): { underlay: Stitch[]; top: Stitch[] } {
-  const spacingPx = (SATIN_SPACING_MM / Math.max(0.1, density)) * pxPerMm;
-  const pullCompPx = pullCompMm * pxPerMm;
-  const underlayStepPx = UNDERLAY_RUN_LEN_MM * pxPerMm;
-  const top: Stitch[] = [];
-  const underlay: Stitch[] = [];
-
-  for (const poly of polylines) {
-    const samples = sampleAlong(poly, spacingPx);
-    if (samples.length === 0) continue;
-
-    let avgHalfThickPx = 0;
-    let avgN = 0;
-
-    // One stitch per sample (alternating edge); the renderer connects
-    // consecutive endpoints, drawing the zigzag back-and-forth that you see
-    // on a real satin stitch.
-    let toggle = false;
-    for (const s of samples) {
-      const px = -s.ty;
-      const py = s.tx;
-      const lo = castRay(s.x, s.y, -px, -py, mask, width, height);
-      const hi = castRay(s.x, s.y, px, py, mask, width, height);
-      avgHalfThickPx += (lo + hi) / 2;
-      avgN++;
-      const useHi = toggle;
-      const ex = useHi ? s.x + px * (hi + pullCompPx) : s.x - px * (lo + pullCompPx);
-      const ey = useHi ? s.y + py * (hi + pullCompPx) : s.y - py * (lo + pullCompPx);
-      top.push(ptMm(ex, ey, pxPerMm));
-      toggle = !toggle;
-    }
-
-    const halfThicknessMm = avgN > 0 ? avgHalfThickPx / avgN / pxPerMm : 0;
-    const thicknessMm = halfThicknessMm * 2;
-
-    // Underlay: center-run for narrow satin; edge-zigzag (left-right
-    // alternating along the skeleton) for wider satin.
-    const underSamples = sampleAlong(poly, underlayStepPx);
-    if (thicknessMm <= NARROW_SATIN_THRESHOLD_MM) {
-      for (const s of underSamples) underlay.push(ptMm(s.x, s.y, pxPerMm));
-    } else {
-      let toggle2 = false;
-      for (const s of underSamples) {
-        const px = -s.ty;
-        const py = s.tx;
-        const lo = castRay(s.x, s.y, -px, -py, mask, width, height);
-        const hi = castRay(s.x, s.y, px, py, mask, width, height);
-        const useHi = toggle2;
-        const ex = useHi ? s.x + px * hi : s.x - px * lo;
-        const ey = useHi ? s.y + py * hi : s.y - py * lo;
-        underlay.push(ptMm(ex, ey, pxPerMm));
-        toggle2 = !toggle2;
-      }
-    }
-  }
-
-  return { underlay, top };
 }
 
 function principalAngle(pixels: number[], width: number): number {
@@ -744,6 +645,72 @@ function emitSatinLane(
     toggle = !toggle;
   }
   return out;
+}
+
+function generateAxisSatin(
+  pixels: number[],
+  width: number,
+  pxPerMm: number,
+  density: number,
+  pullCompMm: number,
+): { underlay: Stitch[]; top: Stitch[] } {
+  const angle = principalAngle(pixels, width);
+  const prof = buildAxisProfile(pixels, width, angle);
+  const pullCompPx = pullCompMm * pxPerMm;
+
+  const sLoFn = (t: number) => perpAt(prof, t).sMin;
+  const sHiFn = (t: number) => perpAt(prof, t).sMax;
+  const isValidT = (t: number) => {
+    const { sMin, sMax } = perpAt(prof, t);
+    return isFinite(sMin) && isFinite(sMax);
+  };
+
+  const top = emitSatinLane(
+    prof,
+    sLoFn,
+    sHiFn,
+    isValidT,
+    pxPerMm,
+    density,
+    pullCompPx,
+  );
+
+  let thicknessSum = 0;
+  let samples = 0;
+  const sampleStep = Math.max(1, (prof.tMax - prof.tMin) / 16);
+  for (let t = prof.tMin; t <= prof.tMax; t += sampleStep) {
+    const { sMin, sMax } = perpAt(prof, t);
+    if (!isFinite(sMin) || !isFinite(sMax)) continue;
+    thicknessSum += (sMax - sMin) / pxPerMm;
+    samples++;
+  }
+  const thicknessMm = samples > 0 ? thicknessSum / samples : 0;
+
+  const underlay: Stitch[] = [];
+  const stepPx = UNDERLAY_RUN_LEN_MM * pxPerMm;
+  if (thicknessMm <= NARROW_SATIN_THRESHOLD_MM) {
+    for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += stepPx) {
+      const { sMin, sMax } = perpAt(prof, t);
+      if (!isFinite(sMin) || !isFinite(sMax)) continue;
+      const sMid = (sMin + sMax) / 2;
+      const x = prof.cx + t * prof.cosA + sMid * -prof.sinA;
+      const y = prof.cy + t * prof.sinA + sMid * prof.cosA;
+      underlay.push(ptMm(x, y, pxPerMm));
+    }
+  } else {
+    let toggle = false;
+    for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += stepPx) {
+      const { sMin, sMax } = perpAt(prof, t);
+      if (!isFinite(sMin) || !isFinite(sMax)) continue;
+      const s = toggle ? sMax : sMin;
+      const px = prof.cx + t * prof.cosA;
+      const py = prof.cy + t * prof.sinA;
+      underlay.push(ptMm(px + s * -prof.sinA, py + s * prof.cosA, pxPerMm));
+      toggle = !toggle;
+    }
+  }
+
+  return { underlay, top };
 }
 
 function generateSplitSatin(
@@ -937,32 +904,26 @@ export function digitize(
       let top: Stitch[] = [];
       let stitchType: StitchType;
 
-      if (type === "running" || type === "satin") {
+      if (type === "running") {
         const crop = cropMaskOfComponent(pixels, width, height);
         const cropSkel = skeletonize(crop.mask, crop.cw, crop.ch);
         const localPolys = traceSkeleton(cropSkel, crop.cw, crop.ch);
         const polylines = localPolys.map((poly) =>
           poly.map((p) => ({ x: p.x + crop.cx, y: p.y + crop.cy })),
         );
-
-        if (type === "running") {
-          top = generateRunningFromSkeleton(polylines, pxPerMm, color.density);
-          stitchType = "running";
-        } else {
-          const componentMask = maskFromPixels(pixels, width, height);
-          const r = generateCurvedSatin(
-            polylines,
-            componentMask,
-            width,
-            height,
-            pxPerMm,
-            color.density,
-            color.pullCompMm,
-          );
-          underlay = r.underlay;
-          top = r.top;
-          stitchType = "satin";
-        }
+        top = generateRunningFromSkeleton(polylines, pxPerMm, color.density);
+        stitchType = "running";
+      } else if (type === "satin") {
+        const r = generateAxisSatin(
+          pixels,
+          width,
+          pxPerMm,
+          color.density,
+          color.pullCompMm,
+        );
+        underlay = r.underlay;
+        top = r.top;
+        stitchType = "satin";
       } else if (type === "split-satin") {
         const r = generateSplitSatin(
           pixels,

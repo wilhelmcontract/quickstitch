@@ -56,7 +56,7 @@ const COLOR_CANDIDATE_MULTIPLIER = 4;
 
 const RUN_STITCH_LEN_MM = 3.0;
 const SATIN_SPACING_MM = 0.4;
-const FILL_ROW_SPACING_MM = 0.4;
+const FILL_ROW_SPACING_MM = 0.25;
 const FILL_STITCH_LEN_MM = 2.3;
 const SATIN_LANE_WIDTH_MM = 5.0;
 const SATIN_MAX_THICKNESS_MM = 6.0;
@@ -785,7 +785,8 @@ function generateFill(
 ): { underlay: Stitch[]; top: Stitch[] } {
   const FILL_ANGLE_DEG = 55;
   const fillAngle = (FILL_ANGLE_DEG * Math.PI) / 180;
-  const prof = buildAxisProfile(pixels, width, fillAngle);
+  // Stitches run AT 55°; rows advance PERPENDICULAR to 55° (= 145°).
+  const prof = buildAxisProfile(pixels, width, fillAngle + Math.PI / 2);
   const pullCompPx = pullCompMm * pxPerMm;
 
   const rowSpacingPx = (FILL_ROW_SPACING_MM / Math.max(0.1, density)) * pxPerMm;

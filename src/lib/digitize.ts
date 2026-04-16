@@ -1039,8 +1039,8 @@ export function renderDigitizedToCanvas(
   const offsetPx = marginMm * displayPxPerMm;
   const tx = (xMm: number) => xMm * displayPxPerMm + offsetPx;
   const ty = (yMm: number) => yMm * displayPxPerMm + offsetPx;
-  const underlayThread = displayPxPerMm * 0.18;
-  const topThread = displayPxPerMm * 0.22;
+  const underlayThread = displayPxPerMm * 0.35;
+  const topThread = displayPxPerMm * 0.45;
 
   for (const region of result.regions) {
     const color = colors[region.colorIndex];

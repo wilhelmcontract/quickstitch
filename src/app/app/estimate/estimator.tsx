@@ -11,13 +11,12 @@ import { saveProject } from "../actions";
 import {
   parseDstFromFile,
   renderDstRealistic,
-  drawRealisticStitch,
   type DstParseResult,
 } from "@/lib/dstParser";
 import {
   detectColors,
   digitize,
-  renderDigitizedToCanvas,
+  digitizeResultToDst,
   type ColorPlan,
   type DigitizeResult,
 } from "@/lib/digitize";
@@ -187,18 +186,16 @@ export function Estimator() {
     return digitize(imageRgba, widthMm, colorPlans);
   }, [kind, imageRgba, colorPlans, designWidthIn]);
 
-  // Render the digitized result to the stitch canvas.
+  // Render the digitized result using the same DST renderer for realistic look.
   useEffect(() => {
     if (kind !== "image" || !digitized) return;
     const canvas = stitchCanvasRef.current;
     if (!canvas) return;
-    renderDigitizedToCanvas(
+    const { parseResult, threadColors } = digitizeResultToDst(
       digitized,
       colorPlans,
-      canvas,
-      drawRealisticStitch,
-      DISPLAY_PX_PER_MM,
     );
+    renderDstRealistic(parseResult, threadColors, canvas);
   }, [kind, digitized, colorPlans]);
 
   // DST: per-color-stop normal-stitch counts.

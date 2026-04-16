@@ -1,3 +1,5 @@
+import type { DstStitch, DstColorStop, DstParseResult } from "./dstParser";
+
 /**
  * Quickie raster-to-stitch digitizer.
  *
@@ -999,79 +1001,101 @@ export function digitize(
   };
 }
 
-export function renderDigitizedToCanvas(
+/**
+ * Convert digitize output into the same DstParseResult format used by the
+ * DST parser, so the existing renderDstRealistic renderer can draw it with
+ * the same realistic thread look. Coordinates are converted from mm (y-down)
+ * to DST units (0.1mm, y-up). Jumps are inserted between disconnected regions.
+ */
+export function digitizeResultToDst(
   result: DigitizeResult,
   colors: ColorPlan[],
-  canvas: HTMLCanvasElement,
-  drawStitch: (
-    ctx: CanvasRenderingContext2D,
-    x1: number,
-    y1: number,
-    x2: number,
-    y2: number,
-    color: string,
-    threadWidth?: number,
-    lightAngle?: number,
-  ) => void,
-  displayPxPerMm: number,
-): void {
-  // Minimum 4″ (101.6mm) empty space around the design; can be larger.
-  const MIN_MARGIN_MM = 101.6 / 2;
-  const marginMm = Math.max(MIN_MARGIN_MM, 4);
-  const canvasWMm = result.widthMm + marginMm * 2;
-  const canvasHMm = result.heightMm + marginMm * 2;
-  canvas.width = Math.max(100, Math.round(canvasWMm * displayPxPerMm));
-  canvas.height = Math.max(100, Math.round(canvasHMm * displayPxPerMm));
+): { parseResult: DstParseResult; threadColors: string[] } {
+  const stitches: DstStitch[] = [];
+  const threadColors: string[] = [];
+  let lastColorIndex = -1;
 
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (const region of result.regions) {
+    if (colors[region.colorIndex].excluded) continue;
 
-  const checkSize = 12;
-  for (let cy = 0; cy < canvas.height; cy += checkSize) {
-    for (let cx = 0; cx < canvas.width; cx += checkSize) {
-      const isDark =
-        (Math.floor(cx / checkSize) + Math.floor(cy / checkSize)) % 2 === 0;
-      ctx.fillStyle = isDark ? "#d4d4d8" : "#f4f4f5";
-      ctx.fillRect(cx, cy, checkSize, checkSize);
+    if (region.colorIndex !== lastColorIndex) {
+      if (lastColorIndex >= 0) {
+        const last = stitches[stitches.length - 1];
+        stitches.push({ x: last?.x ?? 0, y: last?.y ?? 0, type: "stop" });
+      }
+      threadColors.push(colors[region.colorIndex].hex);
+      lastColorIndex = region.colorIndex;
+    }
+
+    const allStitches = [...region.underlay, ...region.topStitches];
+    for (let i = 0; i < allStitches.length; i++) {
+      const s = allStitches[i];
+      const x = Math.round(s.x * 10);
+      const y = Math.round(-s.y * 10);
+      if (i === 0 && stitches.length > 0) {
+        stitches.push({ x, y, type: "jump" });
+      }
+      stitches.push({ x, y, type: "normal" });
     }
   }
 
-  const offsetPx = marginMm * displayPxPerMm;
-  const tx = (xMm: number) => xMm * displayPxPerMm + offsetPx;
-  const ty = (yMm: number) => yMm * displayPxPerMm + offsetPx;
-  const underlayThread = displayPxPerMm * 0.35;
-  const topThread = displayPxPerMm * 0.45;
+  stitches.push({ x: 0, y: 0, type: "end" });
 
-  for (const region of result.regions) {
-    const color = colors[region.colorIndex];
-    if (!color || color.excluded) continue;
-    drawSequence(ctx, region.underlay, color.hex, underlayThread, tx, ty, drawStitch);
-    drawSequence(ctx, region.topStitches, color.hex, topThread, tx, ty, drawStitch);
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let normalCount = 0;
+  for (const s of stitches) {
+    if (s.type === "end") break;
+    if (s.x < minX) minX = s.x;
+    if (s.x > maxX) maxX = s.x;
+    if (s.y < minY) minY = s.y;
+    if (s.y > maxY) maxY = s.y;
+    if (s.type === "normal") normalCount++;
   }
-}
+  if (!isFinite(minX)) {
+    minX = 0; maxX = 0; minY = 0; maxY = 0;
+  }
 
-function drawSequence(
-  ctx: CanvasRenderingContext2D,
-  stitches: Stitch[],
-  hex: string,
-  threadWidth: number,
-  tx: (m: number) => number,
-  ty: (m: number) => number,
-  drawStitch: (
-    ctx: CanvasRenderingContext2D,
-    x1: number,
-    y1: number,
-    x2: number,
-    y2: number,
-    color: string,
-    threadWidth?: number,
-    lightAngle?: number,
-  ) => void,
-) {
-  for (let i = 1; i < stitches.length; i++) {
-    const a = stitches[i - 1];
-    const b = stitches[i];
-    drawStitch(ctx, tx(a.x), ty(a.y), tx(b.x), ty(b.y), hex, threadWidth);
+  const colorStops: DstColorStop[] = [];
+  let currentStopStart = 0;
+  let stopNumber = 1;
+  for (let i = 0; i < stitches.length; i++) {
+    const st = stitches[i];
+    if (st.type === "stop" || st.type === "end" || i === stitches.length - 1) {
+      colorStops.push({
+        stopNumber,
+        startStitchIndex: currentStopStart,
+        endStitchIndex: i,
+        stitchCount: i - currentStopStart + 1,
+        defaultHex: threadColors[stopNumber - 1] ?? "#000000",
+      });
+      if (st.type === "stop") {
+        stopNumber++;
+        currentStopStart = i + 1;
+      }
+    }
+    if (st.type === "end") break;
   }
+
+  const widthMm = (maxX - minX) / 10;
+  const heightMm = (maxY - minY) / 10;
+
+  const parseResult: DstParseResult = {
+    stitches,
+    colorStops,
+    totalStitchCount: normalCount,
+    bounds: {
+      minX, minY, maxX, maxY,
+      width: maxX - minX,
+      height: maxY - minY,
+    },
+    widthMm,
+    heightMm,
+    widthInches: Math.round((widthMm / 25.4) * 100) / 100,
+    heightInches: Math.round((heightMm / 25.4) * 100) / 100,
+  };
+
+  return { parseResult, threadColors };
 }

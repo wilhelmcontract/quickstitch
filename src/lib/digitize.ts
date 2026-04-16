@@ -821,23 +821,33 @@ function generateFill(
     rowIdx++;
   }
 
-  // Zigzag underlay: back-and-forth across the region at ~10° (near
-  // perpendicular to the 55° fill). Each step advances along the underlay
-  // axis then crosses to the opposite edge, creating the zigzag.
+  // Underlay: back-and-forth parallel lines at ~10°. Each row runs across
+  // the region edge-to-edge, then steps to the next row and runs back.
   const underlay: Stitch[] = [];
   const UNDERLAY_ANGLE_DEG = 10;
-  const underlayAngle = (UNDERLAY_ANGLE_DEG * Math.PI) / 180;
-  const profU = buildAxisProfile(pixels, width, underlayAngle);
+  const underlayRowAngle = (UNDERLAY_ANGLE_DEG * Math.PI) / 180;
+  const advanceAngle = underlayRowAngle + Math.PI / 2;
+  const profU = buildAxisProfile(pixels, width, advanceAngle);
   const underlayRowPx = UNDERLAY_FILL_ROW_SPACING_MM * pxPerMm;
-  let zigToggle = false;
+  const underlayStitchPx = 2.0 * pxPerMm;
+  let rowReverse = false;
   for (let t = profU.tMin; t <= profU.tMax + 1e-6; t += underlayRowPx) {
     const { sMin, sMax } = perpAt(profU, t);
     if (!isFinite(sMin) || !isFinite(sMax)) continue;
-    const s = zigToggle ? sMax : sMin;
-    const px = profU.cx + t * profU.cosA + s * -profU.sinA;
-    const py = profU.cy + t * profU.sinA + s * profU.cosA;
-    underlay.push(ptMm(px, py, pxPerMm));
-    zigToggle = !zigToggle;
+    if (rowReverse) {
+      for (let s = sMax; s >= sMin - 1e-6; s -= underlayStitchPx) {
+        const px = profU.cx + t * profU.cosA + s * -profU.sinA;
+        const py = profU.cy + t * profU.sinA + s * profU.cosA;
+        underlay.push(ptMm(px, py, pxPerMm));
+      }
+    } else {
+      for (let s = sMin; s <= sMax + 1e-6; s += underlayStitchPx) {
+        const px = profU.cx + t * profU.cosA + s * -profU.sinA;
+        const py = profU.cy + t * profU.sinA + s * profU.cosA;
+        underlay.push(ptMm(px, py, pxPerMm));
+      }
+    }
+    rowReverse = !rowReverse;
   }
 
   return { underlay, top };
@@ -1004,15 +1014,13 @@ export function renderDigitizedToCanvas(
   ) => void,
   displayPxPerMm: number,
 ): void {
-  const padding = 16;
-  canvas.width = Math.max(
-    100,
-    Math.round(result.widthMm * displayPxPerMm + padding * 2),
-  );
-  canvas.height = Math.max(
-    100,
-    Math.round(result.heightMm * displayPxPerMm + padding * 2),
-  );
+  // Minimum 4″ (101.6mm) empty space around the design; can be larger.
+  const MIN_MARGIN_MM = 101.6 / 2;
+  const marginMm = Math.max(MIN_MARGIN_MM, 4);
+  const canvasWMm = result.widthMm + marginMm * 2;
+  const canvasHMm = result.heightMm + marginMm * 2;
+  canvas.width = Math.max(100, Math.round(canvasWMm * displayPxPerMm));
+  canvas.height = Math.max(100, Math.round(canvasHMm * displayPxPerMm));
 
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -1028,10 +1036,11 @@ export function renderDigitizedToCanvas(
     }
   }
 
-  const tx = (xMm: number) => xMm * displayPxPerMm + padding;
-  const ty = (yMm: number) => yMm * displayPxPerMm + padding;
-  const underlayThread = displayPxPerMm * 0.18;
-  const topThread = displayPxPerMm * 0.22;
+  const offsetPx = marginMm * displayPxPerMm;
+  const tx = (xMm: number) => xMm * displayPxPerMm + offsetPx;
+  const ty = (yMm: number) => yMm * displayPxPerMm + offsetPx;
+  const underlayThread = displayPxPerMm * 0.14;
+  const topThread = displayPxPerMm * 0.18;
 
   for (const region of result.regions) {
     const color = colors[region.colorIndex];

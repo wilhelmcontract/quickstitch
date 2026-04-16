@@ -777,8 +777,9 @@ function generateFill(
   density: number,
   pullCompMm: number,
 ): { underlay: Stitch[]; top: Stitch[] } {
-  const angle = principalAngle(pixels, width);
-  const prof = buildAxisProfile(pixels, width, angle);
+  const FILL_ANGLE_DEG = 55;
+  const fillAngle = (FILL_ANGLE_DEG * Math.PI) / 180;
+  const prof = buildAxisProfile(pixels, width, fillAngle);
   const pullCompPx = pullCompMm * pxPerMm;
 
   const rowSpacingPx = (FILL_ROW_SPACING_MM / Math.max(0.1, density)) * pxPerMm;
@@ -794,7 +795,9 @@ function generateFill(
     }
     const sStart = sMin - pullCompPx;
     const sEnd = sMax + pullCompPx;
-    const offset = (rowIdx % 2) * (stitchLenPx / 2);
+    // Tatami offset: shift each row by 1/4 stitch length × row index (mod 4)
+    // so no two adjacent rows start at the same point.
+    const offset = (rowIdx % 4) * (stitchLenPx / 4);
     const reverse = rowIdx % 2 === 1;
     if (reverse) {
       for (let s = sEnd - offset; s >= sStart - 1e-6; s -= stitchLenPx) {
@@ -812,10 +815,10 @@ function generateFill(
     rowIdx++;
   }
 
-  // Grid underlay: parallel rows perpendicular to the top fill direction.
+  // Grid underlay: rows perpendicular to the 55° fill direction.
   const underlay: Stitch[] = [];
   const underlayRowPx = UNDERLAY_FILL_ROW_SPACING_MM * pxPerMm;
-  const profU = buildAxisProfile(pixels, width, angle + Math.PI / 2);
+  const profU = buildAxisProfile(pixels, width, fillAngle + Math.PI / 2);
   for (let t = profU.tMin; t <= profU.tMax + 1e-6; t += underlayRowPx) {
     const { sMin, sMax } = perpAt(profU, t);
     if (!isFinite(sMin) || !isFinite(sMax)) continue;

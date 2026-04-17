@@ -84,6 +84,8 @@ export function Estimator() {
   const [maskDims, setMaskDims] = useState<{ w: number; h: number } | null>(
     null,
   );
+  const [vectorSvg, setVectorSvg] = useState<string | null>(null);
+  const [previewView, setPreviewView] = useState<"stitch" | "vector">("stitch");
   const [selectedForMerge, setSelectedForMerge] = useState<Set<number>>(
     new Set(),
   );
@@ -131,6 +133,7 @@ export function Estimator() {
     setColorPlans(v.palette.map(defaultColorPlan));
     setColorMasks(v.masks);
     setMaskDims({ w: v.width, h: v.height });
+    setVectorSvg(v.svgString);
     setSelectedForMerge(new Set());
   }
 
@@ -449,20 +452,54 @@ export function Estimator() {
       </section>
 
       <section className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-500">
-          Stitch preview
-        </h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-500">
+            {previewView === "stitch" ? "Stitch preview" : "Vector output"}
+          </h2>
+          {kind === "image" && vectorSvg && (
+            <div className="flex gap-1 text-xs">
+              <button
+                onClick={() => setPreviewView("stitch")}
+                className={`rounded-md px-2 py-1 ${
+                  previewView === "stitch"
+                    ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-50 dark:text-zinc-900"
+                    : "border border-zinc-300 dark:border-zinc-700"
+                }`}
+              >
+                Stitch
+              </button>
+              <button
+                onClick={() => setPreviewView("vector")}
+                className={`rounded-md px-2 py-1 ${
+                  previewView === "vector"
+                    ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-50 dark:text-zinc-900"
+                    : "border border-zinc-300 dark:border-zinc-700"
+                }`}
+              >
+                Vector
+              </button>
+            </div>
+          )}
+        </div>
 
         <div className="mt-4 flex min-h-[320px] items-center justify-center rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-zinc-950 p-4">
-          {file ? (
+          {!file && (
+            <p className="text-sm text-zinc-500">
+              Upload artwork to see the stitch preview.
+            </p>
+          )}
+          {file && previewView === "stitch" && (
             <canvas
               ref={stitchCanvasRef}
               className="max-h-[480px] max-w-full object-contain"
             />
-          ) : (
-            <p className="text-sm text-zinc-500">
-              Upload artwork to see the stitch preview.
-            </p>
+          )}
+          {file && previewView === "vector" && vectorSvg && (
+            <div
+              className="[&_svg]:max-h-[480px] [&_svg]:max-w-full [&_svg]:h-auto [&_svg]:w-auto bg-white rounded"
+              // eslint-disable-next-line react/no-danger
+              dangerouslySetInnerHTML={{ __html: vectorSvg }}
+            />
           )}
         </div>
 

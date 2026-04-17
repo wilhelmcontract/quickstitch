@@ -13,6 +13,7 @@ export type VectorizeResult = {
   height: number;
   palette: VectorPaletteEntry[];
   masks: Uint8Array[]; // one mask per palette entry, same order as palette
+  svgString: string; // traced SVG for debug/inspection view
 };
 
 const BG_THRESHOLD = 240;
@@ -246,11 +247,30 @@ export function vectorize(
     mask: smoothMask(e.mask, width, height),
   }));
 
+  // Also trace SVG paths with the same seeded palette so the debug view
+  // reflects what the quantizer actually decided.
+  const svgString = ImageTracer.imagedataToSVG(imgd, {
+    pal: seedPalette,
+    colorquantcycles: 1,
+    mincolorratio: 0,
+    blurradius: 3,
+    blurdelta: 20,
+    ltres: 1,
+    qtres: 1,
+    pathomit: 8,
+    roundcoords: 1,
+    strokewidth: 0,
+    linefilter: true,
+    rightangleenhance: true,
+    viewbox: true,
+  });
+
   return {
     width,
     height,
     palette: smoothed.map((e) => e.pal),
     masks: smoothed.map((e) => e.mask),
+    svgString,
   };
 }
 

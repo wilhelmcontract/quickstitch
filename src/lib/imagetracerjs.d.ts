@@ -15,6 +15,10 @@ declare module "imagetracerjs" {
         pal?: Palette[];
       },
     ) => QuantResult;
+    imagedataToSVG: (
+      imgd: { data: Uint8ClampedArray; width: number; height: number },
+      options: Record<string, unknown>,
+    ) => string;
   };
 
   export default ImageTracer;

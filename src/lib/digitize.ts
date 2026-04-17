@@ -58,14 +58,15 @@ const COLOR_CANDIDATE_MULTIPLIER = 4;
 
 const RUN_STITCH_LEN_MM = 3.0;
 const SATIN_SPACING_MM = 0.4;
-const FILL_ROW_SPACING_MM = 0.25;
-const FILL_STITCH_LEN_MM = 2.3;
+const FILL_ROW_SPACING_MM = 0.4;
+const FILL_STITCH_LEN_MM = 4.0;
 const SATIN_LANE_WIDTH_MM = 5.0;
 const SATIN_MAX_THICKNESS_MM = 6.0;
 const RUNNING_MAX_THICKNESS_MM = 1.0;
 
 const UNDERLAY_RUN_LEN_MM = 1.5;
 const UNDERLAY_FILL_ROW_SPACING_MM = 2.0;
+const UNDERLAY_FILL_STITCH_LEN_MM = 3.6;
 const NARROW_SATIN_THRESHOLD_MM = 2.5;
 
 const MIN_COMPONENT_PX = 8;
@@ -831,7 +832,7 @@ function generateFill(
   const advanceAngle = underlayRowAngle + Math.PI / 2;
   const profU = buildAxisProfile(pixels, width, advanceAngle);
   const underlayRowPx = UNDERLAY_FILL_ROW_SPACING_MM * pxPerMm;
-  const underlayStitchPx = 2.0 * pxPerMm;
+  const underlayStitchPx = UNDERLAY_FILL_STITCH_LEN_MM * pxPerMm;
   let rowReverse = false;
   for (let t = profU.tMin; t <= profU.tMax + 1e-6; t += underlayRowPx) {
     const { sMin, sMax } = perpAt(profU, t);

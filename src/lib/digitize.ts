@@ -43,7 +43,7 @@ export type DigitizeResult = {
   perColorStitchCount: number[];
 };
 
-const RUN_STITCH_LEN_MM = 3.0;
+const RUN_STITCH_LEN_MM = 1.5;
 const SATIN_SPACING_MM = 0.4;
 const FILL_ROW_SPACING_MM = 0.4;
 const FILL_STITCH_LEN_MM = 4.0;

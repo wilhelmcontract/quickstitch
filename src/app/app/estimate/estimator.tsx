@@ -84,8 +84,13 @@ export function Estimator() {
   const [maskDims, setMaskDims] = useState<{ w: number; h: number } | null>(
     null,
   );
-  const [vectorSvg, setVectorSvg] = useState<string | null>(null);
-  const [previewView, setPreviewView] = useState<"stitch" | "vector">("stitch");
+  const [processedRgba, setProcessedRgba] = useState<Uint8ClampedArray | null>(
+    null,
+  );
+  const [previewView, setPreviewView] = useState<"stitch" | "processed">(
+    "stitch",
+  );
+  const processedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [selectedForMerge, setSelectedForMerge] = useState<Set<number>>(
     new Set(),
   );
@@ -133,7 +138,7 @@ export function Estimator() {
     setColorPlans(v.palette.map(defaultColorPlan));
     setColorMasks(v.masks);
     setMaskDims({ w: v.width, h: v.height });
-    setVectorSvg(v.svgString);
+    setProcessedRgba(v.processedRgba);
     setSelectedForMerge(new Set());
   }
 
@@ -229,6 +234,20 @@ export function Estimator() {
     );
     renderDstRealistic(parseResult, threadColors, canvas);
   }, [kind, digitized, colorPlans]);
+
+  // Draw the posterized processed bitmap onto its canvas when in processed view.
+  useEffect(() => {
+    if (previewView !== "processed" || !processedRgba || !maskDims) return;
+    const canvas = processedCanvasRef.current;
+    if (!canvas) return;
+    canvas.width = maskDims.w;
+    canvas.height = maskDims.h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const imgd = ctx.createImageData(maskDims.w, maskDims.h);
+    imgd.data.set(processedRgba);
+    ctx.putImageData(imgd, 0, 0);
+  }, [previewView, processedRgba, maskDims]);
 
   // DST: per-color-stop normal-stitch counts.
   const normalCountsByStop = useMemo<number[]>(() => {
@@ -454,9 +473,9 @@ export function Estimator() {
       <section className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-500">
-            {previewView === "stitch" ? "Stitch preview" : "Vector output"}
+            {previewView === "stitch" ? "Stitch preview" : "Processed bitmap"}
           </h2>
-          {kind === "image" && vectorSvg && (
+          {kind === "image" && processedRgba && (
             <div className="flex gap-1 text-xs">
               <button
                 onClick={() => setPreviewView("stitch")}
@@ -469,14 +488,14 @@ export function Estimator() {
                 Stitch
               </button>
               <button
-                onClick={() => setPreviewView("vector")}
+                onClick={() => setPreviewView("processed")}
                 className={`rounded-md px-2 py-1 ${
-                  previewView === "vector"
+                  previewView === "processed"
                     ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-50 dark:text-zinc-900"
                     : "border border-zinc-300 dark:border-zinc-700"
                 }`}
               >
-                Vector
+                Processed
               </button>
             </div>
           )}
@@ -488,17 +507,18 @@ export function Estimator() {
               Upload artwork to see the stitch preview.
             </p>
           )}
-          {file && previewView === "stitch" && (
+          {file && (
             <canvas
               ref={stitchCanvasRef}
-              className="max-h-[480px] max-w-full object-contain"
+              className={`max-h-[480px] max-w-full object-contain ${
+                previewView === "stitch" ? "" : "hidden"
+              }`}
             />
           )}
-          {file && previewView === "vector" && vectorSvg && (
-            <div
-              className="[&_svg]:max-h-[480px] [&_svg]:max-w-full [&_svg]:h-auto [&_svg]:w-auto bg-white rounded"
-              // eslint-disable-next-line react/no-danger
-              dangerouslySetInnerHTML={{ __html: vectorSvg }}
+          {file && previewView === "processed" && (
+            <canvas
+              ref={processedCanvasRef}
+              className="max-h-[480px] max-w-full object-contain"
             />
           )}
         </div>

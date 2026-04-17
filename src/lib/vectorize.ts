@@ -13,7 +13,7 @@ export type VectorizeResult = {
   height: number;
   palette: VectorPaletteEntry[];
   masks: Uint8Array[]; // one mask per palette entry, same order as palette
-  svgString: string; // traced SVG for debug/inspection view
+  processedRgba: Uint8ClampedArray; // posterized bitmap — each pixel painted with its assigned palette color; matches Hatch's "Processed Bitmap"
 };
 
 const BG_THRESHOLD = 240;
@@ -247,30 +247,29 @@ export function vectorize(
     mask: smoothMask(e.mask, width, height),
   }));
 
-  // Also trace SVG paths with the same seeded palette so the debug view
-  // reflects what the quantizer actually decided.
-  const svgString = ImageTracer.imagedataToSVG(imgd, {
-    pal: seedPalette,
-    colorquantcycles: 1,
-    mincolorratio: 0,
-    blurradius: 3,
-    blurdelta: 20,
-    ltres: 1,
-    qtres: 1,
-    pathomit: 8,
-    roundcoords: 1,
-    strokewidth: 0,
-    linefilter: true,
-    rightangleenhance: true,
-    viewbox: true,
-  });
+  // Build the posterized "Processed Bitmap": paint each pixel with its
+  // assigned palette color. Shows exactly what the quantizer decided —
+  // compare to original to see where color detection went right/wrong.
+  const processedRgba = new Uint8ClampedArray(width * height * 4);
+  for (let p = 0; p < smoothed.length; p++) {
+    const { r, g, b } = smoothed[p].pal;
+    const mask = smoothed[p].mask;
+    for (let i = 0; i < width * height; i++) {
+      if (!mask[i]) continue;
+      const o = i * 4;
+      processedRgba[o] = r;
+      processedRgba[o + 1] = g;
+      processedRgba[o + 2] = b;
+      processedRgba[o + 3] = 255;
+    }
+  }
 
   return {
     width,
     height,
     palette: smoothed.map((e) => e.pal),
     masks: smoothed.map((e) => e.mask),
-    svgString,
+    processedRgba,
   };
 }
 

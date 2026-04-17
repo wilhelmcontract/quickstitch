@@ -497,16 +497,6 @@ function emitSatinLane(
   return out;
 }
 
-function polyLen(poly: { x: number; y: number }[]): number {
-  let len = 0;
-  for (let i = 1; i < poly.length; i++) {
-    const dx = poly[i].x - poly[i - 1].x;
-    const dy = poly[i].y - poly[i - 1].y;
-    len += Math.sqrt(dx * dx + dy * dy);
-  }
-  return len;
-}
-
 function smoothPoly(
   poly: { x: number; y: number }[],
   halfWin: number,
@@ -549,15 +539,10 @@ function generateSkeletonSatin(
 
   const crop = cropMaskOfComponent(pixels, width, height);
   const skel = skeletonize(crop.mask, crop.cw, crop.ch);
-  const localPolys = traceSkeleton(skel, crop.cw, crop.ch)
+  const smoothedPolys = traceSkeleton(skel, crop.cw, crop.ch)
     .filter((p) => p.length >= 3)
     .map((p) => smoothPoly(smoothPoly(p, 6), 6));
-  if (localPolys.length === 0) return { underlay: [], top: [] };
-
-  let primary = localPolys[0];
-  for (const p of localPolys) {
-    if (polyLen(p) > polyLen(primary)) primary = p;
-  }
+  if (smoothedPolys.length === 0) return { underlay: [], top: [] };
 
   const insideLocal = (lx: number, ly: number): boolean => {
     const ix = Math.floor(lx);
@@ -584,34 +569,41 @@ function generateSkeletonSatin(
     return d;
   };
 
+  // Process EVERY skeleton polyline, not just the longest — shapes with
+  // branches (e.g. a shield's pointed bottom meeting the ring body) trace
+  // into multiple polylines and dropping any of them leaves part of the
+  // outline un-stitched.
   const top: Stitch[] = [];
-  let toggle = false;
-  for (const s of sampleAlong(primary, spacingPx)) {
-    if (!insideLocal(s.x, s.y)) continue;
-    const perpX = -s.ty;
-    const perpY = s.tx;
-    const upper = walkOut(s.x, s.y, perpX, perpY);
-    const lower = walkOut(s.x, s.y, -perpX, -perpY);
-    if (upper + lower < 0.5 * pxPerMm) continue;
-    const uEnd = upper + pullCompPx;
-    const lEnd = lower + pullCompPx;
-    const gx = s.x + crop.cx;
-    const gy = s.y + crop.cy;
-    const ax = gx - perpX * lEnd;
-    const ay = gy - perpY * lEnd;
-    const bx = gx + perpX * uEnd;
-    const by = gy + perpY * uEnd;
-    if (toggle) top.push(ptMm(bx, by, pxPerMm), ptMm(ax, ay, pxPerMm));
-    else top.push(ptMm(ax, ay, pxPerMm), ptMm(bx, by, pxPerMm));
-    toggle = !toggle;
-  }
-
   const underlay: Stitch[] = [];
   const edgeWalkStepPx = 2.0 * pxPerMm;
-  for (const s of sampleAlong(primary, edgeWalkStepPx)) {
-    const gx = s.x + crop.cx;
-    const gy = s.y + crop.cy;
-    underlay.push(ptMm(gx, gy, pxPerMm));
+
+  for (const poly of smoothedPolys) {
+    let toggle = false;
+    for (const s of sampleAlong(poly, spacingPx)) {
+      if (!insideLocal(s.x, s.y)) continue;
+      const perpX = -s.ty;
+      const perpY = s.tx;
+      const upper = walkOut(s.x, s.y, perpX, perpY);
+      const lower = walkOut(s.x, s.y, -perpX, -perpY);
+      if (upper + lower < 0.5 * pxPerMm) continue;
+      const uEnd = upper + pullCompPx;
+      const lEnd = lower + pullCompPx;
+      const gx = s.x + crop.cx;
+      const gy = s.y + crop.cy;
+      const ax = gx - perpX * lEnd;
+      const ay = gy - perpY * lEnd;
+      const bx = gx + perpX * uEnd;
+      const by = gy + perpY * uEnd;
+      if (toggle) top.push(ptMm(bx, by, pxPerMm), ptMm(ax, ay, pxPerMm));
+      else top.push(ptMm(ax, ay, pxPerMm), ptMm(bx, by, pxPerMm));
+      toggle = !toggle;
+    }
+
+    for (const s of sampleAlong(poly, edgeWalkStepPx)) {
+      const gx = s.x + crop.cx;
+      const gy = s.y + crop.cy;
+      underlay.push(ptMm(gx, gy, pxPerMm));
+    }
   }
 
   return { underlay, top };

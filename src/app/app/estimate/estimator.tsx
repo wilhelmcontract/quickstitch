@@ -591,6 +591,20 @@ export function Estimator() {
           )}
         </div>
 
+        {kind === "image" && accepted && colorPlans.length > 0 && (
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <span className="text-xs text-zinc-500 mr-1">Colors</span>
+            {colorPlans.map((c) => (
+              <span
+                key={c.hex}
+                title={c.hex}
+                className="inline-block h-6 w-6 rounded-sm border border-zinc-300 dark:border-zinc-600"
+                style={{ backgroundColor: c.hex }}
+              />
+            ))}
+          </div>
+        )}
+
         {kind === "image" && (
           <div className="mt-4 flex flex-wrap items-center gap-4">
             <label className="flex items-center gap-2 text-sm">

@@ -220,12 +220,26 @@ export function vectorize(
   );
   const pixelCounts = new Array<number>(slotCount).fill(0);
 
+  // Apply the same background filter used in seeding: transparent or
+  // near-white pixels represent background and shouldn't belong to any
+  // color's mask. Without this, the tracer assigns every pixel to some
+  // palette slot (there's no "no-color" slot), so a logo with a white
+  // or transparent interior/exterior collapses into one solid shape
+  // mask covering the whole image — classified as fill, stitched solid.
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      const idx = quant.array[y + 1][x + 1];
-      if (idx < 0 || idx >= slotCount) continue;
-      rawMasks[idx][y * width + x] = 1;
-      pixelCounts[idx]++;
+      const pixelIdx = y * width + x;
+      const off = pixelIdx * 4;
+      const a = data[off + 3];
+      if (a < 32) continue;
+      const r = data[off];
+      const g = data[off + 1];
+      const b = data[off + 2];
+      if (r >= BG_THRESHOLD && g >= BG_THRESHOLD && b >= BG_THRESHOLD) continue;
+      const paletteIdx = quant.array[y + 1][x + 1];
+      if (paletteIdx < 0 || paletteIdx >= slotCount) continue;
+      rawMasks[paletteIdx][pixelIdx] = 1;
+      pixelCounts[paletteIdx]++;
     }
   }
 

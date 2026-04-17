@@ -1,4 +1,5 @@
 import type { DstStitch, DstColorStop, DstParseResult } from "./dstParser";
+import { smoothMask } from "./vectorize";
 
 /**
  * Raster-to-stitch digitizer. Inputs are per-color binary masks built upstream
@@ -834,8 +835,11 @@ export function digitize(
   for (let ci = 0; ci < colors.length; ci++) {
     const color = colors[ci];
     if (color.excluded) continue;
-    const dt = distanceTransform(masks[ci], width, height);
-    const { pixelsByLabel } = connectedComponents(masks[ci], width, height);
+    // Round pixel-level jaggies just-in-time so the stitched output has
+    // smooth edges, but the prep preview stays faithful to the raw quant.
+    const smoothed = smoothMask(masks[ci], width, height);
+    const dt = distanceTransform(smoothed, width, height);
+    const { pixelsByLabel } = connectedComponents(smoothed, width, height);
     for (const pixels of pixelsByLabel) {
       if (pixels.length < MIN_COMPONENT_PX) continue;
 

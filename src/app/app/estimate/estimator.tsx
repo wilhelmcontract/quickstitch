@@ -108,6 +108,7 @@ export function Estimator() {
   const [detailLevel, setDetailLevel] = useState(DEFAULT_DETAIL);
   const [locateOn, setLocateOn] = useState(false);
   const processedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const detailDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [selectedForMerge, setSelectedForMerge] = useState<Set<number>>(
     new Set(),
   );
@@ -162,6 +163,7 @@ export function Estimator() {
     setColorMasks(v.masks);
     setMaskDims({ w: v.width, h: v.height });
     setSelectedForMerge(new Set());
+    setLocateOn(false);
   }
 
   // Posterized "Processed Bitmap" — each pixel painted with its assigned
@@ -188,9 +190,15 @@ export function Estimator() {
     return rgba;
   }, [colorMasks, colorPlans, maskDims, locateOn, selectedForMerge]);
 
+  // Debounce detail slider: vectorize can be 1-2s of blocking JS on large
+  // images, and firing it on every onChange tick makes the slider feel frozen.
+  // Coalesce to the last value after the user stops dragging.
   function onDetailChange(d: number) {
     setDetailLevel(d);
-    if (imageRgba) runDetect(imageRgba, d);
+    if (detailDebounceRef.current) clearTimeout(detailDebounceRef.current);
+    detailDebounceRef.current = setTimeout(() => {
+      if (imageRgba) runDetect(imageRgba, d);
+    }, 250);
   }
 
   function acceptPrep() {

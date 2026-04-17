@@ -159,13 +159,16 @@ function erode3(mask: Uint8Array, width: number, height: number): Uint8Array {
   return out;
 }
 
-/** Two passes of morphological close (dilate→erode) — rounds pixel-level
- *  jaggies and fills small gaps. One pass is often too subtle to see at the
- *  rendered preview scale; two passes double the smoothing radius while still
- *  preserving region area since dilate and erode cancel each other. */
-function smoothMask(mask: Uint8Array, width: number, height: number): Uint8Array {
-  const once = erode3(dilate3(mask, width, height), width, height);
-  return erode3(dilate3(once, width, height), width, height);
+/** Morphological close (dilate→erode): rounds pixel-level jaggies and fills
+ *  single-pixel gaps without significantly changing region area. Applied at
+ *  stitch time, not during vectorize — the prep preview should match the raw
+ *  quantization pixel-for-pixel so the user can judge color detection. */
+export function smoothMask(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+): Uint8Array {
+  return erode3(dilate3(mask, width, height), width, height);
 }
 
 /**
@@ -248,16 +251,11 @@ export function vectorize(
   kept.sort((a, b) => b.pal.pixelCount - a.pal.pixelCount);
   const trimmed = kept.slice(0, numColors);
 
-  const smoothed = trimmed.map((e) => ({
-    pal: e.pal,
-    mask: smoothMask(e.mask, width, height),
-  }));
-
   return {
     width,
     height,
-    palette: smoothed.map((e) => e.pal),
-    masks: smoothed.map((e) => e.mask),
+    palette: trimmed.map((e) => e.pal),
+    masks: trimmed.map((e) => e.mask),
   };
 }
 

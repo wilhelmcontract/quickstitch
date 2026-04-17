@@ -46,9 +46,29 @@ type RgbaImage = {
 };
 
 const DEFAULT_DESIGN_WIDTH_IN = 4;
-const DEFAULT_NUM_COLORS = 4;
+const DEFAULT_DETAIL = 4;
 const MM_PER_INCH = 25.4;
 const DISPLAY_PX_PER_MM = 8;
+
+/**
+ * Detail slider (0-10) → vectorize params.
+ *   0: few, heavily blurred clusters (2 colors, big AA smoothing).
+ *  10: every distinct bucket including pixelated/AA variants (up to 48 slots,
+ *      no blur, single-pixel buckets allowed).
+ * User combines down manually from the revealed palette.
+ */
+function detailToVectorizeOptions(detail: number): {
+  numColors: number;
+  blurRadius: number;
+  minBucketCount: number;
+} {
+  const t = Math.max(0, Math.min(10, detail)) / 10;
+  return {
+    numColors: Math.round(2 + t * 46),
+    blurRadius: Math.round(6 - t * 6),
+    minBucketCount: Math.max(1, Math.round(40 - t * 39)),
+  };
+}
 
 function detectKind(f: File): FileKind {
   return /\.dst$/i.test(f.name) ? "dst" : "image";
@@ -77,7 +97,6 @@ export function Estimator() {
   const [parseError, setParseError] = useState<string | null>(null);
 
   const [designWidthIn, setDesignWidthIn] = useState(DEFAULT_DESIGN_WIDTH_IN);
-  const [numColors, setNumColors] = useState(DEFAULT_NUM_COLORS);
   const [imageRgba, setImageRgba] = useState<RgbaImage | null>(null);
   const [colorPlans, setColorPlans] = useState<ColorPlan[]>([]);
   const [colorMasks, setColorMasks] = useState<Uint8Array[]>([]);
@@ -86,7 +105,7 @@ export function Estimator() {
   );
   const [prepOpen, setPrepOpen] = useState(false);
   const [accepted, setAccepted] = useState(false);
-  const [detailLevel, setDetailLevel] = useState(7); // 0-10; blurRadius = 10 - detail
+  const [detailLevel, setDetailLevel] = useState(DEFAULT_DETAIL);
   const processedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [selectedForMerge, setSelectedForMerge] = useState<Set<number>>(
     new Set(),
@@ -127,14 +146,17 @@ export function Estimator() {
     const id = ctx.getImageData(0, 0, img.naturalWidth, img.naturalHeight);
     const rgba = { data: id.data, width: id.width, height: id.height };
     setImageRgba(rgba);
-    runDetect(rgba, numColors, detailLevel);
+    runDetect(rgba, detailLevel);
     setAccepted(false);
     setPrepOpen(true);
   }
 
-  function runDetect(rgba: RgbaImage, n: number, detail: number) {
-    const blurRadius = Math.max(0, 10 - detail);
-    const v = vectorize(rgba.data, rgba.width, rgba.height, n, { blurRadius });
+  function runDetect(rgba: RgbaImage, detail: number) {
+    const opts = detailToVectorizeOptions(detail);
+    const v = vectorize(rgba.data, rgba.width, rgba.height, opts.numColors, {
+      blurRadius: opts.blurRadius,
+      minBucketCount: opts.minBucketCount,
+    });
     setColorPlans(v.palette.map(defaultColorPlan));
     setColorMasks(v.masks);
     setMaskDims({ w: v.width, h: v.height });
@@ -161,14 +183,9 @@ export function Estimator() {
     return rgba;
   }, [colorMasks, colorPlans, maskDims]);
 
-  function onNumColorsChange(n: number) {
-    setNumColors(n);
-    if (imageRgba) runDetect(imageRgba, n, detailLevel);
-  }
-
   function onDetailChange(d: number) {
     setDetailLevel(d);
-    if (imageRgba) runDetect(imageRgba, numColors, d);
+    if (imageRgba) runDetect(imageRgba, d);
   }
 
   function acceptPrep() {
@@ -683,20 +700,8 @@ export function Estimator() {
             </div>
 
             <div className="mt-4 flex flex-wrap items-center gap-6">
-              <label className="flex items-center gap-2 text-sm">
-                <span className="font-medium"># colors</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={16}
-                  step={1}
-                  value={numColors}
-                  onChange={(e) => onNumColorsChange(Number(e.target.value))}
-                  className="h-9 w-16 rounded-md border border-zinc-300 dark:border-zinc-700 bg-transparent px-2"
-                />
-              </label>
               <label className="flex flex-1 items-center gap-3 text-sm min-w-[240px]">
-                <span className="font-medium">Detail</span>
+                <span className="font-medium whitespace-nowrap">Detail</span>
                 <input
                   type="range"
                   min={0}
@@ -706,8 +711,13 @@ export function Estimator() {
                   onChange={(e) => onDetailChange(Number(e.target.value))}
                   className="flex-1"
                 />
-                <span className="w-6 text-right text-zinc-500">{detailLevel}</span>
+                <span className="w-8 text-right text-zinc-500">
+                  {detailLevel}
+                </span>
               </label>
+              <span className="text-xs text-zinc-500">
+                {colorPlans.length} colors — combine similar ones below
+              </span>
             </div>
 
             {colorPlans.length > 0 && (

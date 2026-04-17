@@ -34,6 +34,7 @@ function kmeansPPSeed(
   width: number,
   height: number,
   numColors: number,
+  minBucketCount: number,
 ): { r: number; g: number; b: number; a: number }[] {
   type Bucket = { r: number; g: number; b: number; count: number };
   const buckets = new Map<number, Bucket>();
@@ -57,11 +58,8 @@ function kmeansPPSeed(
     }
   }
 
-  // Keep any bucket with at least ~10 pixels so small-but-distinct regions
-  // (e.g. a thin shield outline) still enter the k-means++ candidate pool.
-  // Capping at top-N would drop them — the top ranks are all noise variants
-  // of whatever dominates the image.
-  const minBucketCount = Math.max(8, Math.floor((width * height) * 0.00005));
+  // Candidate pool threshold is now caller-provided — at max detail we let
+  // single-pixel buckets through so every pixelated variant gets its own slot.
   const candidates: Bucket[] = Array.from(buckets.values())
     .filter((c) => c.count >= minBucketCount)
     .map((c) => ({
@@ -185,12 +183,19 @@ export function vectorize(
   width: number,
   height: number,
   numColors: number,
-  options: { blurRadius?: number } = {},
+  options: { blurRadius?: number; minBucketCount?: number } = {},
 ): VectorizeResult {
   const imgd = { data, width, height };
   const blurRadius = options.blurRadius ?? 3;
+  const minBucketCount = options.minBucketCount ?? 8;
 
-  const seedPalette = kmeansPPSeed(data, width, height, numColors);
+  const seedPalette = kmeansPPSeed(
+    data,
+    width,
+    height,
+    numColors,
+    minBucketCount,
+  );
 
   // colorquantcycles: 1 — use our k-means++ seeds as the final palette
   // without Lloyd refinement. imagetracerjs's refinement can randomize

@@ -649,73 +649,121 @@ function emitSatinLane(
   return out;
 }
 
-function generateAxisSatin(
+function polyLen(poly: { x: number; y: number }[]): number {
+  let len = 0;
+  for (let i = 1; i < poly.length; i++) {
+    const dx = poly[i].x - poly[i - 1].x;
+    const dy = poly[i].y - poly[i - 1].y;
+    len += Math.sqrt(dx * dx + dy * dy);
+  }
+  return len;
+}
+
+function smoothPoly(
+  poly: { x: number; y: number }[],
+  halfWin: number,
+): { x: number; y: number }[] {
+  if (poly.length < 3) return poly;
+  const out: { x: number; y: number }[] = [];
+  for (let i = 0; i < poly.length; i++) {
+    let sx = 0;
+    let sy = 0;
+    let n = 0;
+    const lo = Math.max(0, i - halfWin);
+    const hi = Math.min(poly.length - 1, i + halfWin);
+    for (let j = lo; j <= hi; j++) {
+      sx += poly[j].x;
+      sy += poly[j].y;
+      n++;
+    }
+    out.push({ x: sx / n, y: sy / n });
+  }
+  return out;
+}
+
+/**
+ * Satin that FOLLOWS the component's skeleton (the centerline/spine). At each
+ * sample along the skeleton the stitch runs perpendicular to the local tangent
+ * from one edge of the mask to the other, so curved shapes (rings, script,
+ * arcs) get stitches that follow the curve instead of crossing it at a single
+ * fixed axis.
+ */
+function generateSkeletonSatin(
   pixels: number[],
   width: number,
+  height: number,
   pxPerMm: number,
   density: number,
   pullCompMm: number,
 ): { underlay: Stitch[]; top: Stitch[] } {
-  const angle = principalAngle(pixels, width);
-  const prof = buildAxisProfile(pixels, width, angle);
+  const spacingPx = (SATIN_SPACING_MM / Math.max(0.1, density)) * pxPerMm;
   const pullCompPx = pullCompMm * pxPerMm;
 
-  const sLoFn = (t: number) => perpAt(prof, t).sMin;
-  const sHiFn = (t: number) => perpAt(prof, t).sMax;
-  const isValidT = (t: number) => {
-    const { sMin, sMax } = perpAt(prof, t);
-    return isFinite(sMin) && isFinite(sMax);
+  const crop = cropMaskOfComponent(pixels, width, height);
+  const skel = skeletonize(crop.mask, crop.cw, crop.ch);
+  const localPolys = traceSkeleton(skel, crop.cw, crop.ch)
+    .filter((p) => p.length >= 3)
+    .map((p) => smoothPoly(p, 3));
+  if (localPolys.length === 0) return { underlay: [], top: [] };
+
+  let primary = localPolys[0];
+  for (const p of localPolys) {
+    if (polyLen(p) > polyLen(primary)) primary = p;
+  }
+
+  const insideLocal = (lx: number, ly: number): boolean => {
+    const ix = Math.floor(lx);
+    const iy = Math.floor(ly);
+    if (ix < 0 || iy < 0 || ix >= crop.cw || iy >= crop.ch) return false;
+    return crop.mask[iy * crop.cw + ix] !== 0;
   };
 
-  const top = emitSatinLane(
-    prof,
-    sLoFn,
-    sHiFn,
-    isValidT,
-    pxPerMm,
-    density,
-    pullCompPx,
-  );
+  const walkOut = (
+    lx: number,
+    ly: number,
+    dx: number,
+    dy: number,
+  ): number => {
+    const step = 0.5;
+    const maxSteps = Math.max(crop.cw, crop.ch) * 2;
+    let d = 0;
+    for (let i = 1; i <= maxSteps; i++) {
+      const nx = lx + dx * step * i;
+      const ny = ly + dy * step * i;
+      if (!insideLocal(nx, ny)) break;
+      d = step * i;
+    }
+    return d;
+  };
 
-  let thicknessSum = 0;
-  let samples = 0;
-  const sampleStep = Math.max(1, (prof.tMax - prof.tMin) / 16);
-  for (let t = prof.tMin; t <= prof.tMax; t += sampleStep) {
-    const { sMin, sMax } = perpAt(prof, t);
-    if (!isFinite(sMin) || !isFinite(sMax)) continue;
-    thicknessSum += (sMax - sMin) / pxPerMm;
-    samples++;
+  const top: Stitch[] = [];
+  let toggle = false;
+  for (const s of sampleAlong(primary, spacingPx)) {
+    if (!insideLocal(s.x, s.y)) continue;
+    const perpX = -s.ty;
+    const perpY = s.tx;
+    const upper = walkOut(s.x, s.y, perpX, perpY);
+    const lower = walkOut(s.x, s.y, -perpX, -perpY);
+    if (upper + lower < 0.5 * pxPerMm) continue;
+    const uEnd = upper + pullCompPx;
+    const lEnd = lower + pullCompPx;
+    const gx = s.x + crop.cx;
+    const gy = s.y + crop.cy;
+    const ax = gx - perpX * lEnd;
+    const ay = gy - perpY * lEnd;
+    const bx = gx + perpX * uEnd;
+    const by = gy + perpY * uEnd;
+    if (toggle) top.push(ptMm(bx, by, pxPerMm), ptMm(ax, ay, pxPerMm));
+    else top.push(ptMm(ax, ay, pxPerMm), ptMm(bx, by, pxPerMm));
+    toggle = !toggle;
   }
-  const thicknessMm = samples > 0 ? thicknessSum / samples : 0;
 
   const underlay: Stitch[] = [];
-
-  // Layer 1: edge-walk — running stitch along the center, 2mm spacing.
   const edgeWalkStepPx = 2.0 * pxPerMm;
-  for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += edgeWalkStepPx) {
-    const { sMin, sMax } = perpAt(prof, t);
-    if (!isFinite(sMin) || !isFinite(sMax)) continue;
-    const sMid = (sMin + sMax) / 2;
-    const x = prof.cx + t * prof.cosA + sMid * -prof.sinA;
-    const y = prof.cy + t * prof.sinA + sMid * prof.cosA;
-    underlay.push(ptMm(x, y, pxPerMm));
-  }
-
-  // Layer 2 (wider satin only): zigzag — center→top→center→bottom pattern,
-  // advancing ~0.5mm per crossing along the axis.
-  if (thicknessMm > NARROW_SATIN_THRESHOLD_MM) {
-    const zigAdvancePx = 0.5 * pxPerMm;
-    let phase = 0;
-    for (let t = prof.tMin; t <= prof.tMax + 1e-6; t += zigAdvancePx) {
-      const { sMin, sMax } = perpAt(prof, t);
-      if (!isFinite(sMin) || !isFinite(sMax)) continue;
-      const sMid = (sMin + sMax) / 2;
-      const s = phase === 0 ? sMid : phase === 1 ? sMax : phase === 2 ? sMid : sMin;
-      const px = prof.cx + t * prof.cosA + s * -prof.sinA;
-      const py = prof.cy + t * prof.sinA + s * prof.cosA;
-      underlay.push(ptMm(px, py, pxPerMm));
-      phase = (phase + 1) % 4;
-    }
+  for (const s of sampleAlong(primary, edgeWalkStepPx)) {
+    const gx = s.x + crop.cx;
+    const gy = s.y + crop.cy;
+    underlay.push(ptMm(gx, gy, pxPerMm));
   }
 
   return { underlay, top };
@@ -960,9 +1008,10 @@ export function digitize(
         top = generateRunningFromSkeleton(polylines, pxPerMm, color.density);
         stitchType = "running";
       } else if (type === "satin") {
-        const r = generateAxisSatin(
+        const r = generateSkeletonSatin(
           pixels,
           width,
+          height,
           pxPerMm,
           color.density,
           color.pullCompMm,

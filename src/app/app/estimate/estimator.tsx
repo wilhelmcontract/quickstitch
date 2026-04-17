@@ -66,7 +66,7 @@ function defaultColorPlan(c: {
     excluded: false,
     density: 1.0,
     pullCompMm: 0.2,
-    splitWideSatin: true,
+    splitWideSatin: false,
   };
 }
 

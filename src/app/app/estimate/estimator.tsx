@@ -84,12 +84,9 @@ export function Estimator() {
   const [maskDims, setMaskDims] = useState<{ w: number; h: number } | null>(
     null,
   );
-  const [processedRgba, setProcessedRgba] = useState<Uint8ClampedArray | null>(
-    null,
-  );
-  const [previewView, setPreviewView] = useState<"stitch" | "processed">(
-    "stitch",
-  );
+  const [prepOpen, setPrepOpen] = useState(false);
+  const [accepted, setAccepted] = useState(false);
+  const [detailLevel, setDetailLevel] = useState(7); // 0-10; blurRadius = 10 - detail
   const processedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [selectedForMerge, setSelectedForMerge] = useState<Set<number>>(
     new Set(),
@@ -130,21 +127,62 @@ export function Estimator() {
     const id = ctx.getImageData(0, 0, img.naturalWidth, img.naturalHeight);
     const rgba = { data: id.data, width: id.width, height: id.height };
     setImageRgba(rgba);
-    runDetect(rgba, numColors);
+    runDetect(rgba, numColors, detailLevel);
+    setAccepted(false);
+    setPrepOpen(true);
   }
 
-  function runDetect(rgba: RgbaImage, n: number) {
-    const v = vectorize(rgba.data, rgba.width, rgba.height, n);
+  function runDetect(rgba: RgbaImage, n: number, detail: number) {
+    const blurRadius = Math.max(0, 10 - detail);
+    const v = vectorize(rgba.data, rgba.width, rgba.height, n, { blurRadius });
     setColorPlans(v.palette.map(defaultColorPlan));
     setColorMasks(v.masks);
     setMaskDims({ w: v.width, h: v.height });
-    setProcessedRgba(v.processedRgba);
     setSelectedForMerge(new Set());
   }
 
+  // Posterized "Processed Bitmap" — each pixel painted with its assigned
+  // palette color. Derived so combine/exclude changes update immediately.
+  const processedRgba = useMemo<Uint8ClampedArray | null>(() => {
+    if (!maskDims || colorMasks.length !== colorPlans.length) return null;
+    const rgba = new Uint8ClampedArray(maskDims.w * maskDims.h * 4);
+    for (let p = 0; p < colorMasks.length; p++) {
+      const { r, g, b } = colorPlans[p];
+      const mask = colorMasks[p];
+      for (let i = 0; i < mask.length; i++) {
+        if (!mask[i]) continue;
+        const o = i * 4;
+        rgba[o] = r;
+        rgba[o + 1] = g;
+        rgba[o + 2] = b;
+        rgba[o + 3] = 255;
+      }
+    }
+    return rgba;
+  }, [colorMasks, colorPlans, maskDims]);
+
   function onNumColorsChange(n: number) {
     setNumColors(n);
-    if (imageRgba) runDetect(imageRgba, n);
+    if (imageRgba) runDetect(imageRgba, n, detailLevel);
+  }
+
+  function onDetailChange(d: number) {
+    setDetailLevel(d);
+    if (imageRgba) runDetect(imageRgba, numColors, d);
+  }
+
+  function acceptPrep() {
+    setAccepted(true);
+    setPrepOpen(false);
+  }
+
+  function cancelPrep() {
+    setPrepOpen(false);
+  }
+
+  function editPrep() {
+    setAccepted(false);
+    setPrepOpen(true);
   }
 
   function combineSelected() {
@@ -207,6 +245,7 @@ export function Estimator() {
   const digitized = useMemo<DigitizeResult | null>(() => {
     if (
       kind !== "image" ||
+      !accepted ||
       !maskDims ||
       colorPlans.length === 0 ||
       colorMasks.length !== colorPlans.length
@@ -221,7 +260,7 @@ export function Estimator() {
       widthMm,
       colorPlans,
     );
-  }, [kind, colorMasks, maskDims, colorPlans, designWidthIn]);
+  }, [kind, accepted, colorMasks, maskDims, colorPlans, designWidthIn]);
 
   // Render the digitized result using the same DST renderer for realistic look.
   useEffect(() => {
@@ -235,9 +274,10 @@ export function Estimator() {
     renderDstRealistic(parseResult, threadColors, canvas);
   }, [kind, digitized, colorPlans]);
 
-  // Draw the posterized processed bitmap onto its canvas when in processed view.
+  // Draw the posterized processed bitmap onto its canvas whenever the prep
+  // modal is open (the modal mounts the canvas).
   useEffect(() => {
-    if (previewView !== "processed" || !processedRgba || !maskDims) return;
+    if (!prepOpen || !processedRgba || !maskDims) return;
     const canvas = processedCanvasRef.current;
     if (!canvas) return;
     canvas.width = maskDims.w;
@@ -247,7 +287,7 @@ export function Estimator() {
     const imgd = ctx.createImageData(maskDims.w, maskDims.h);
     imgd.data.set(processedRgba);
     ctx.putImageData(imgd, 0, 0);
-  }, [previewView, processedRgba, maskDims]);
+  }, [prepOpen, processedRgba, maskDims]);
 
   // DST: per-color-stop normal-stitch counts.
   const normalCountsByStop = useMemo<number[]>(() => {
@@ -473,31 +513,15 @@ export function Estimator() {
       <section className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6">
         <div className="flex items-center justify-between">
           <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-500">
-            {previewView === "stitch" ? "Stitch preview" : "Processed bitmap"}
+            Stitch preview
           </h2>
-          {kind === "image" && processedRgba && (
-            <div className="flex gap-1 text-xs">
-              <button
-                onClick={() => setPreviewView("stitch")}
-                className={`rounded-md px-2 py-1 ${
-                  previewView === "stitch"
-                    ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-50 dark:text-zinc-900"
-                    : "border border-zinc-300 dark:border-zinc-700"
-                }`}
-              >
-                Stitch
-              </button>
-              <button
-                onClick={() => setPreviewView("processed")}
-                className={`rounded-md px-2 py-1 ${
-                  previewView === "processed"
-                    ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-50 dark:text-zinc-900"
-                    : "border border-zinc-300 dark:border-zinc-700"
-                }`}
-              >
-                Processed
-              </button>
-            </div>
+          {kind === "image" && accepted && (
+            <button
+              onClick={editPrep}
+              className="rounded-md border border-zinc-300 dark:border-zinc-700 px-2 py-1 text-xs font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            >
+              Edit colors
+            </button>
           )}
         </div>
 
@@ -507,17 +531,25 @@ export function Estimator() {
               Upload artwork to see the stitch preview.
             </p>
           )}
-          {file && (
+          {file && kind === "image" && !accepted && (
+            <div className="flex flex-col items-center gap-3">
+              <p className="text-sm text-zinc-500">
+                Prepare the artwork first — adjust the processed bitmap, then
+                accept.
+              </p>
+              {colorMasks.length > 0 && (
+                <button
+                  onClick={() => setPrepOpen(true)}
+                  className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-50 hover:bg-zinc-800 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-200"
+                >
+                  Prepare artwork
+                </button>
+              )}
+            </div>
+          )}
+          {file && (kind === "dst" || accepted) && (
             <canvas
               ref={stitchCanvasRef}
-              className={`max-h-[480px] max-w-full object-contain ${
-                previewView === "stitch" ? "" : "hidden"
-              }`}
-            />
-          )}
-          {file && previewView === "processed" && (
-            <canvas
-              ref={processedCanvasRef}
               className="max-h-[480px] max-w-full object-contain"
             />
           )}
@@ -538,30 +570,7 @@ export function Estimator() {
               />
               <span className="text-zinc-500">inches</span>
             </label>
-            <label className="flex items-center gap-2 text-sm">
-              <span className="font-medium"># colors</span>
-              <input
-                type="number"
-                min={1}
-                max={12}
-                step={1}
-                value={numColors}
-                onChange={(e) => onNumColorsChange(Number(e.target.value))}
-                className="h-9 w-16 rounded-md border border-zinc-300 dark:border-zinc-700 bg-transparent px-2"
-              />
-            </label>
           </div>
-        )}
-
-        {kind === "image" && colorPlans.length > 0 && (
-          <ImageColorList
-            plans={colorPlans}
-            onUpdate={updateColorPlan}
-            stitchCounts={digitized?.perColorStitchCount ?? []}
-            selected={selectedForMerge}
-            onToggleSelected={toggleMergeSelection}
-            onCombine={combineSelected}
-          />
         )}
 
         {kind === "dst" && parsedDst && parsedDst.colorStops.length > 0 && (
@@ -622,6 +631,112 @@ export function Estimator() {
           >
             {isPending ? "Saving…" : "Save project"}
           </button>
+        </div>
+      )}
+
+      {prepOpen && kind === "image" && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 lg:col-span-2">
+          <div className="w-full max-w-6xl max-h-[95vh] overflow-y-auto rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-6 shadow-2xl">
+            <div className="flex items-start justify-between">
+              <div>
+                <h2 className="text-xl font-semibold">Prepare artwork</h2>
+                <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                  Adjust until the processed bitmap matches what you want to
+                  stitch, then accept.
+                </p>
+              </div>
+              <button
+                onClick={cancelPrep}
+                className="rounded-md border border-zinc-300 dark:border-zinc-700 px-3 py-1 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <div>
+                <p className="text-xs uppercase tracking-wider text-zinc-500 mb-2">
+                  Original
+                </p>
+                <div className="flex items-center justify-center rounded-md border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 p-3 h-[320px]">
+                  {imageUrl && (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img
+                      src={imageUrl}
+                      alt="original"
+                      className="max-h-full max-w-full object-contain"
+                    />
+                  )}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs uppercase tracking-wider text-zinc-500 mb-2">
+                  Processed bitmap
+                </p>
+                <div className="flex items-center justify-center rounded-md border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 p-3 h-[320px]">
+                  <canvas
+                    ref={processedCanvasRef}
+                    className="max-h-full max-w-full object-contain"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center gap-6">
+              <label className="flex items-center gap-2 text-sm">
+                <span className="font-medium"># colors</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={16}
+                  step={1}
+                  value={numColors}
+                  onChange={(e) => onNumColorsChange(Number(e.target.value))}
+                  className="h-9 w-16 rounded-md border border-zinc-300 dark:border-zinc-700 bg-transparent px-2"
+                />
+              </label>
+              <label className="flex flex-1 items-center gap-3 text-sm min-w-[240px]">
+                <span className="font-medium">Detail</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={10}
+                  step={1}
+                  value={detailLevel}
+                  onChange={(e) => onDetailChange(Number(e.target.value))}
+                  className="flex-1"
+                />
+                <span className="w-6 text-right text-zinc-500">{detailLevel}</span>
+              </label>
+            </div>
+
+            {colorPlans.length > 0 && (
+              <ImageColorList
+                plans={colorPlans}
+                onUpdate={updateColorPlan}
+                stitchCounts={colorPlans.map((p) => p.pixelCount)}
+                selected={selectedForMerge}
+                onToggleSelected={toggleMergeSelection}
+                onCombine={combineSelected}
+              />
+            )}
+
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                onClick={cancelPrep}
+                className="h-10 rounded-md border border-zinc-300 dark:border-zinc-700 px-4 text-sm font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={acceptPrep}
+                disabled={colorPlans.length === 0}
+                className="h-10 rounded-md bg-zinc-900 px-5 text-sm font-medium text-zinc-50 hover:bg-zinc-800 disabled:opacity-60 dark:bg-zinc-50 dark:text-zinc-900 dark:hover:bg-zinc-200"
+              >
+                Accept &amp; stitch
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

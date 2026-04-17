@@ -57,15 +57,20 @@ function kmeansPPSeed(
     }
   }
 
+  // Keep any bucket with at least ~10 pixels so small-but-distinct regions
+  // (e.g. a thin shield outline) still enter the k-means++ candidate pool.
+  // Capping at top-N would drop them — the top ranks are all noise variants
+  // of whatever dominates the image.
+  const minBucketCount = Math.max(8, Math.floor((width * height) * 0.00005));
   const candidates: Bucket[] = Array.from(buckets.values())
+    .filter((c) => c.count >= minBucketCount)
     .map((c) => ({
       r: Math.round(c.r / c.count),
       g: Math.round(c.g / c.count),
       b: Math.round(c.b / c.count),
       count: c.count,
     }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, Math.max(numColors * 16, 64));
+    .sort((a, b) => b.count - a.count);
 
   if (candidates.length === 0) return [{ r: 0, g: 0, b: 0, a: 255 }];
 
@@ -156,10 +161,13 @@ function erode3(mask: Uint8Array, width: number, height: number): Uint8Array {
   return out;
 }
 
-/** Morphological close (dilate→erode) — rounds pixel-level jaggies and fills
- *  single-pixel gaps without significantly changing region area. */
+/** Two passes of morphological close (dilate→erode) — rounds pixel-level
+ *  jaggies and fills small gaps. One pass is often too subtle to see at the
+ *  rendered preview scale; two passes double the smoothing radius while still
+ *  preserving region area since dilate and erode cancel each other. */
 function smoothMask(mask: Uint8Array, width: number, height: number): Uint8Array {
-  return erode3(dilate3(mask, width, height), width, height);
+  const once = erode3(dilate3(mask, width, height), width, height);
+  return erode3(dilate3(once, width, height), width, height);
 }
 
 /**
@@ -182,10 +190,14 @@ export function vectorize(
 
   const seedPalette = kmeansPPSeed(data, width, height, numColors);
 
+  // colorquantcycles: 1 — use our k-means++ seeds as the final palette
+  // without Lloyd refinement. imagetracerjs's refinement can randomize
+  // low-count clusters via mincolorratio, which kills a small but distinct
+  // region (e.g. a thin shield outline).
   const quant = ImageTracer.colorquantization(imgd, {
     pal: seedPalette,
-    colorquantcycles: 4,
-    mincolorratio: 0.0005,
+    colorquantcycles: 1,
+    mincolorratio: 0,
     blurradius: 3,
     blurdelta: 20,
   });

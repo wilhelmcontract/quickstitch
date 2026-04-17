@@ -14,12 +14,12 @@ import {
   type DstParseResult,
 } from "@/lib/dstParser";
 import {
-  detectColors,
   digitize,
   digitizeResultToDst,
   type ColorPlan,
   type DigitizeResult,
 } from "@/lib/digitize";
+import { orMasks, vectorize } from "@/lib/vectorize";
 
 type FileKind = "image" | "dst";
 
@@ -80,6 +80,10 @@ export function Estimator() {
   const [numColors, setNumColors] = useState(DEFAULT_NUM_COLORS);
   const [imageRgba, setImageRgba] = useState<RgbaImage | null>(null);
   const [colorPlans, setColorPlans] = useState<ColorPlan[]>([]);
+  const [colorMasks, setColorMasks] = useState<Uint8Array[]>([]);
+  const [maskDims, setMaskDims] = useState<{ w: number; h: number } | null>(
+    null,
+  );
   const [selectedForMerge, setSelectedForMerge] = useState<Set<number>>(
     new Set(),
   );
@@ -123,10 +127,10 @@ export function Estimator() {
   }
 
   function runDetect(rgba: RgbaImage, n: number) {
-    const detected = detectColors(rgba.data, rgba.width, rgba.height, {
-      numColors: n,
-    });
-    setColorPlans(detected.map(defaultColorPlan));
+    const v = vectorize(rgba.data, rgba.width, rgba.height, n);
+    setColorPlans(v.palette.map(defaultColorPlan));
+    setColorMasks(v.masks);
+    setMaskDims({ w: v.width, h: v.height });
     setSelectedForMerge(new Set());
   }
 
@@ -140,34 +144,46 @@ export function Estimator() {
     const idx = Array.from(selectedForMerge).sort((a, b) => a - b);
     const keep = idx[0];
     const drop = new Set(idx.slice(1));
-    setColorPlans((prev) => {
-      let r = 0;
-      let g = 0;
-      let b = 0;
-      let total = 0;
-      for (const i of idx) {
-        const c = prev[i];
-        r += c.r * c.pixelCount;
-        g += c.g * c.pixelCount;
-        b += c.b * c.pixelCount;
-        total += c.pixelCount;
-      }
-      const mr = Math.round(r / total);
-      const mg = Math.round(g / total);
-      const mb = Math.round(b / total);
-      const hex = `#${[mr, mg, mb].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
-      const merged: ColorPlan = {
-        ...prev[keep],
-        hex,
-        r: mr,
-        g: mg,
-        b: mb,
-        pixelCount: total,
-      };
-      return prev
-        .map((c, i) => (i === keep ? merged : c))
-        .filter((_, i) => !drop.has(i));
-    });
+
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    let total = 0;
+    for (const i of idx) {
+      const c = colorPlans[i];
+      r += c.r * c.pixelCount;
+      g += c.g * c.pixelCount;
+      b += c.b * c.pixelCount;
+      total += c.pixelCount;
+    }
+    const mr = Math.round(r / total);
+    const mg = Math.round(g / total);
+    const mb = Math.round(b / total);
+    const hex = `#${[mr, mg, mb].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+    const mergedPlan: ColorPlan = {
+      ...colorPlans[keep],
+      hex,
+      r: mr,
+      g: mg,
+      b: mb,
+      pixelCount: total,
+    };
+    let mergedMask = colorMasks[keep];
+    for (const i of idx) {
+      if (i === keep) continue;
+      mergedMask = orMasks(mergedMask, colorMasks[i]);
+    }
+
+    setColorPlans(
+      colorPlans
+        .map((c, i) => (i === keep ? mergedPlan : c))
+        .filter((_, i) => !drop.has(i)),
+    );
+    setColorMasks(
+      colorMasks
+        .map((m, i) => (i === keep ? mergedMask : m))
+        .filter((_, i) => !drop.has(i)),
+    );
     setSelectedForMerge(new Set());
   }
 
@@ -181,10 +197,23 @@ export function Estimator() {
   }
 
   const digitized = useMemo<DigitizeResult | null>(() => {
-    if (kind !== "image" || !imageRgba || colorPlans.length === 0) return null;
+    if (
+      kind !== "image" ||
+      !maskDims ||
+      colorPlans.length === 0 ||
+      colorMasks.length !== colorPlans.length
+    ) {
+      return null;
+    }
     const widthMm = designWidthIn * MM_PER_INCH;
-    return digitize(imageRgba, widthMm, colorPlans);
-  }, [kind, imageRgba, colorPlans, designWidthIn]);
+    return digitize(
+      colorMasks,
+      maskDims.w,
+      maskDims.h,
+      widthMm,
+      colorPlans,
+    );
+  }, [kind, colorMasks, maskDims, colorPlans, designWidthIn]);
 
   // Render the digitized result using the same DST renderer for realistic look.
   useEffect(() => {

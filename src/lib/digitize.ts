@@ -1,25 +1,15 @@
 import type { DstStitch, DstColorStop, DstParseResult } from "./dstParser";
 
 /**
- * Quickie raster-to-stitch digitizer.
+ * Raster-to-stitch digitizer. Inputs are per-color binary masks built upstream
+ * (see src/lib/vectorize.ts — imagetracerjs quantization produces clean masks
+ * without the anti-aliasing noise that raster color-clustering suffers from).
  *
- * Per color (after auto-clustering to a user-specified count and dropping
- * near-white background): build a binary mask, run Zhang-Suen thinning to get
- * a skeleton, label connected components, and classify each component by max
- * thickness (running < 1 mm, satin 1-6 mm, > 6 mm split-or-fill).
- *
- * Satin and running follow the LOCAL skeleton tangent, so curved shapes
- * (script lettering, swooshes) get stitches that follow the curve. Fill uses
- * a straight scanline. Underlay first, then top stitches, both same color.
+ * Per color: run Zhang-Suen thinning to get a skeleton, label connected
+ * components, classify each by max thickness (running < 1 mm, satin 1-6 mm,
+ * > 6 mm split-or-fill). Satin follows the local skeleton tangent; fill uses
+ * a 55° tatami scanline. Underlay first, then top stitches.
  */
-
-export type DetectedColor = {
-  hex: string;
-  r: number;
-  g: number;
-  b: number;
-  pixelCount: number;
-};
 
 export type ColorPlan = {
   hex: string;
@@ -52,10 +42,6 @@ export type DigitizeResult = {
   perColorStitchCount: number[];
 };
 
-const DEFAULT_BG_BRIGHTNESS = 240;
-const DEFAULT_NUM_COLORS = 4;
-const COLOR_CANDIDATE_MULTIPLIER = 8;
-
 const RUN_STITCH_LEN_MM = 3.0;
 const SATIN_SPACING_MM = 0.4;
 const FILL_ROW_SPACING_MM = 0.4;
@@ -70,179 +56,6 @@ const UNDERLAY_FILL_STITCH_LEN_MM = 3.6;
 const NARROW_SATIN_THRESHOLD_MM = 2.5;
 
 const MIN_COMPONENT_PX = 8;
-
-function rgbToHex(r: number, g: number, b: number): string {
-  return `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function isBackground(r: number, g: number, b: number, threshold: number) {
-  return r >= threshold && g >= threshold && b >= threshold;
-}
-
-type RGBSum = { r: number; g: number; b: number; count: number };
-
-function colorDist(a: RGBSum, b: RGBSum): number {
-  const dr = a.r - b.r;
-  const dg = a.g - b.g;
-  const db = a.b - b.b;
-  return dr * dr + dg * dg + db * db;
-}
-
-/**
- * Quantize the image to N dominant colors. Starts from the top
- * `N * COLOR_CANDIDATE_MULTIPLIER` 5-bit-per-channel buckets, then
- * agglomeratively merges the closest pair until N remain.
- */
-export function detectColors(
-  data: Uint8ClampedArray,
-  width: number,
-  height: number,
-  options: { numColors?: number; bgThreshold?: number } = {},
-): DetectedColor[] {
-  const numColors = Math.max(1, options.numColors ?? DEFAULT_NUM_COLORS);
-  const bg = options.bgThreshold ?? DEFAULT_BG_BRIGHTNESS;
-
-  const counts = new Map<number, number>();
-  const sums = new Map<number, RGBSum>();
-
-  for (let i = 0; i < width * height; i++) {
-    const off = i * 4;
-    const a = data[off + 3];
-    if (a < 32) continue;
-    const r = data[off];
-    const g = data[off + 1];
-    const b = data[off + 2];
-    if (isBackground(r, g, b, bg)) continue;
-    const key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-    const s = sums.get(key);
-    if (s) {
-      s.r += r;
-      s.g += g;
-      s.b += b;
-      s.count += 1;
-    } else {
-      sums.set(key, { r, g, b, count: 1 });
-    }
-  }
-
-  const candidates: RGBSum[] = Array.from(counts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, numColors * COLOR_CANDIDATE_MULTIPLIER)
-    .map(([key]) => {
-      const s = sums.get(key);
-      if (!s) throw new Error(`detectColors: missing sum for key ${key}`);
-      return {
-        r: Math.round(s.r / s.count),
-        g: Math.round(s.g / s.count),
-        b: Math.round(s.b / s.count),
-        count: s.count,
-      };
-    });
-
-  if (candidates.length === 0) return [];
-
-  // K-means++ seeding: first seed = most common bucket; each next seed is
-  // the candidate with the largest (min-distance-to-existing-seeds × count),
-  // so colors that are distinct AND non-trivial in area both get picked.
-  // Agglomerative merging (the old approach) weighted centroids by pixel
-  // count and let the dominant bucket pull nearby distinct colors into one
-  // cluster — e.g. a teal background variant would get eaten by a navy
-  // cluster even though they're perceptually separate.
-  const centers: RGBSum[] = [{ ...candidates[0] }];
-  while (centers.length < numColors && centers.length < candidates.length) {
-    let bestIdx = -1;
-    let bestScore = -1;
-    for (let i = 0; i < candidates.length; i++) {
-      let minDist = Infinity;
-      for (const c of centers) {
-        const d = colorDist(candidates[i], c);
-        if (d < minDist) minDist = d;
-      }
-      const score = minDist * candidates[i].count;
-      if (score > bestScore) {
-        bestScore = score;
-        bestIdx = i;
-      }
-    }
-    if (bestIdx < 0) break;
-    centers.push({ ...candidates[bestIdx] });
-  }
-
-  // Lloyd iterations — refine centers by reassigning candidates to the
-  // nearest center and recomputing the weighted centroid.
-  for (let iter = 0; iter < 8; iter++) {
-    const sums = centers.map(() => ({ r: 0, g: 0, b: 0, count: 0 }));
-    for (const p of candidates) {
-      let minDist = Infinity;
-      let bestC = 0;
-      for (let c = 0; c < centers.length; c++) {
-        const d = colorDist(p, centers[c]);
-        if (d < minDist) {
-          minDist = d;
-          bestC = c;
-        }
-      }
-      sums[bestC].r += p.r * p.count;
-      sums[bestC].g += p.g * p.count;
-      sums[bestC].b += p.b * p.count;
-      sums[bestC].count += p.count;
-    }
-    for (let c = 0; c < centers.length; c++) {
-      if (sums[c].count > 0) {
-        centers[c] = {
-          r: Math.round(sums[c].r / sums[c].count),
-          g: Math.round(sums[c].g / sums[c].count),
-          b: Math.round(sums[c].b / sums[c].count),
-          count: sums[c].count,
-        };
-      }
-    }
-  }
-
-  return centers
-    .sort((a, b) => b.count - a.count)
-    .map((c) => ({
-      hex: rgbToHex(c.r, c.g, c.b),
-      r: c.r,
-      g: c.g,
-      b: c.b,
-      pixelCount: c.count,
-    }));
-}
-
-function buildMasks(
-  data: Uint8ClampedArray,
-  width: number,
-  height: number,
-  colors: ColorPlan[],
-  bgThreshold: number,
-): Uint8Array[] {
-  const masks = colors.map(() => new Uint8Array(width * height));
-  for (let i = 0; i < width * height; i++) {
-    const off = i * 4;
-    const a = data[off + 3];
-    if (a < 32) continue;
-    const r = data[off];
-    const g = data[off + 1];
-    const b = data[off + 2];
-    if (isBackground(r, g, b, bgThreshold)) continue;
-    let bestIdx = -1;
-    let bestDist = Infinity;
-    for (let c = 0; c < colors.length; c++) {
-      const dr = r - colors[c].r;
-      const dg = g - colors[c].g;
-      const db = b - colors[c].b;
-      const d = dr * dr + dg * dg + db * db;
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = c;
-      }
-    }
-    if (bestIdx >= 0) masks[bestIdx][i] = 1;
-  }
-  return masks;
-}
 
 /** Two-pass connected-components labeling with union-find (4-connectivity). */
 function connectedComponents(
@@ -968,14 +781,17 @@ function classifyByThickness(
 }
 
 export function digitize(
-  imageData: { data: Uint8ClampedArray; width: number; height: number },
+  masks: Uint8Array[],
+  width: number,
+  height: number,
   designWidthMm: number,
   colors: ColorPlan[],
-  options: { bgThreshold?: number } = {},
 ): DigitizeResult {
-  const { data, width, height } = imageData;
-  const bg = options.bgThreshold ?? DEFAULT_BG_BRIGHTNESS;
-  const masks = buildMasks(data, width, height, colors, bg);
+  if (masks.length !== colors.length) {
+    throw new Error(
+      `digitize: masks (${masks.length}) and colors (${colors.length}) must be same length`,
+    );
+  }
 
   let bMinX = width;
   let bMaxX = -1;

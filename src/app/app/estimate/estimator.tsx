@@ -592,16 +592,33 @@ export function Estimator() {
         </div>
 
         {kind === "image" && accepted && colorPlans.length > 0 && (
-          <div className="mt-4 flex flex-wrap items-center gap-2">
-            <span className="text-xs text-zinc-500 mr-1">Colors</span>
-            {colorPlans.map((c) => (
-              <span
-                key={c.hex}
-                title={c.hex}
-                className="inline-block h-6 w-6 rounded-sm border border-zinc-300 dark:border-zinc-600"
-                style={{ backgroundColor: c.hex }}
-              />
-            ))}
+          <div className="mt-4 space-y-1">
+            <span className="text-xs text-zinc-500">Colors</span>
+            <div className="flex flex-wrap gap-3">
+              {colorPlans.map((c, i) => {
+                const firstRegion = digitized?.regions.find(
+                  (r) => r.colorIndex === i,
+                );
+                const stitchType = firstRegion?.stitchType ?? "—";
+                const stitches = digitized?.perColorStitchCount[i] ?? 0;
+                return (
+                  <div
+                    key={`${c.hex}-${i}`}
+                    className="flex items-center gap-2 rounded-md border border-zinc-300 dark:border-zinc-700 px-2 py-1"
+                  >
+                    <span
+                      title={c.hex}
+                      className="inline-block h-5 w-5 rounded-sm border border-zinc-300 dark:border-zinc-600"
+                      style={{ backgroundColor: c.hex }}
+                    />
+                    <span className="text-xs font-mono">{c.hex}</span>
+                    <span className="text-xs text-zinc-500">
+                      · {stitchType} · {stitches.toLocaleString()}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 

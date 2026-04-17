@@ -195,7 +195,6 @@ function buildMasks(
     let bestIdx = -1;
     let bestDist = Infinity;
     for (let c = 0; c < colors.length; c++) {
-      if (colors[c].excluded) continue;
       const dr = r - colors[c].r;
       const dg = g - colors[c].g;
       const db = b - colors[c].b;

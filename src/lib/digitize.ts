@@ -140,33 +140,67 @@ export function detectColors(
       };
     });
 
-  while (candidates.length > numColors) {
-    let bestI = 0;
-    let bestJ = 1;
-    let bestDist = Infinity;
+  if (candidates.length === 0) return [];
+
+  // K-means++ seeding: first seed = most common bucket; each next seed is
+  // the candidate with the largest (min-distance-to-existing-seeds × count),
+  // so colors that are distinct AND non-trivial in area both get picked.
+  // Agglomerative merging (the old approach) weighted centroids by pixel
+  // count and let the dominant bucket pull nearby distinct colors into one
+  // cluster — e.g. a teal background variant would get eaten by a navy
+  // cluster even though they're perceptually separate.
+  const centers: RGBSum[] = [{ ...candidates[0] }];
+  while (centers.length < numColors && centers.length < candidates.length) {
+    let bestIdx = -1;
+    let bestScore = -1;
     for (let i = 0; i < candidates.length; i++) {
-      for (let j = i + 1; j < candidates.length; j++) {
-        const d = colorDist(candidates[i], candidates[j]);
-        if (d < bestDist) {
-          bestDist = d;
-          bestI = i;
-          bestJ = j;
-        }
+      let minDist = Infinity;
+      for (const c of centers) {
+        const d = colorDist(candidates[i], c);
+        if (d < minDist) minDist = d;
+      }
+      const score = minDist * candidates[i].count;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
       }
     }
-    const a = candidates[bestI];
-    const b = candidates[bestJ];
-    const total = a.count + b.count;
-    candidates[bestI] = {
-      r: Math.round((a.r * a.count + b.r * b.count) / total),
-      g: Math.round((a.g * a.count + b.g * b.count) / total),
-      b: Math.round((a.b * a.count + b.b * b.count) / total),
-      count: total,
-    };
-    candidates.splice(bestJ, 1);
+    if (bestIdx < 0) break;
+    centers.push({ ...candidates[bestIdx] });
   }
 
-  return candidates
+  // Lloyd iterations — refine centers by reassigning candidates to the
+  // nearest center and recomputing the weighted centroid.
+  for (let iter = 0; iter < 8; iter++) {
+    const sums = centers.map(() => ({ r: 0, g: 0, b: 0, count: 0 }));
+    for (const p of candidates) {
+      let minDist = Infinity;
+      let bestC = 0;
+      for (let c = 0; c < centers.length; c++) {
+        const d = colorDist(p, centers[c]);
+        if (d < minDist) {
+          minDist = d;
+          bestC = c;
+        }
+      }
+      sums[bestC].r += p.r * p.count;
+      sums[bestC].g += p.g * p.count;
+      sums[bestC].b += p.b * p.count;
+      sums[bestC].count += p.count;
+    }
+    for (let c = 0; c < centers.length; c++) {
+      if (sums[c].count > 0) {
+        centers[c] = {
+          r: Math.round(sums[c].r / sums[c].count),
+          g: Math.round(sums[c].g / sums[c].count),
+          b: Math.round(sums[c].b / sums[c].count),
+          count: sums[c].count,
+        };
+      }
+    }
+  }
+
+  return centers
     .sort((a, b) => b.count - a.count)
     .map((c) => ({
       hex: rgbToHex(c.r, c.g, c.b),
@@ -703,7 +737,7 @@ function generateSkeletonSatin(
   const skel = skeletonize(crop.mask, crop.cw, crop.ch);
   const localPolys = traceSkeleton(skel, crop.cw, crop.ch)
     .filter((p) => p.length >= 3)
-    .map((p) => smoothPoly(p, 3));
+    .map((p) => smoothPoly(smoothPoly(p, 6), 6));
   if (localPolys.length === 0) return { underlay: [], top: [] };
 
   let primary = localPolys[0];

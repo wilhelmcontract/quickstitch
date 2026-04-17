@@ -54,7 +54,7 @@ export type DigitizeResult = {
 
 const DEFAULT_BG_BRIGHTNESS = 240;
 const DEFAULT_NUM_COLORS = 4;
-const COLOR_CANDIDATE_MULTIPLIER = 4;
+const COLOR_CANDIDATE_MULTIPLIER = 8;
 
 const RUN_STITCH_LEN_MM = 3.0;
 const SATIN_SPACING_MM = 0.4;
@@ -113,7 +113,7 @@ export function detectColors(
     const g = data[off + 1];
     const b = data[off + 2];
     if (isBackground(r, g, b, bg)) continue;
-    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+    const key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
     counts.set(key, (counts.get(key) ?? 0) + 1);
     const s = sums.get(key);
     if (s) {

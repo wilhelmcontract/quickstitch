@@ -22,6 +22,147 @@ function rgbToHex(r: number, g: number, b: number): string {
 }
 
 /**
+ * K-means++ seeding on 6-bits-per-channel bucketed candidates. The first seed
+ * is the most common bucket; each next seed is the candidate that maximizes
+ * (min-distance-to-existing-seeds × pixelCount). This keeps distinct colors
+ * with non-trivial area — in particular thin bright elements like a shield
+ * outline — from losing their slot to yet another shade of the dominant dark
+ * background.
+ */
+function kmeansPPSeed(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+  numColors: number,
+): { r: number; g: number; b: number; a: number }[] {
+  type Bucket = { r: number; g: number; b: number; count: number };
+  const buckets = new Map<number, Bucket>();
+  for (let i = 0; i < width * height; i++) {
+    const off = i * 4;
+    const a = data[off + 3];
+    if (a < 32) continue;
+    const r = data[off];
+    const g = data[off + 1];
+    const b = data[off + 2];
+    if (r >= BG_THRESHOLD && g >= BG_THRESHOLD && b >= BG_THRESHOLD) continue;
+    const key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
+    const existing = buckets.get(key);
+    if (existing) {
+      existing.r += r;
+      existing.g += g;
+      existing.b += b;
+      existing.count += 1;
+    } else {
+      buckets.set(key, { r, g, b, count: 1 });
+    }
+  }
+
+  const candidates: Bucket[] = Array.from(buckets.values())
+    .map((c) => ({
+      r: Math.round(c.r / c.count),
+      g: Math.round(c.g / c.count),
+      b: Math.round(c.b / c.count),
+      count: c.count,
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, Math.max(numColors * 16, 64));
+
+  if (candidates.length === 0) return [{ r: 0, g: 0, b: 0, a: 255 }];
+
+  const seeds: Bucket[] = [{ ...candidates[0] }];
+  while (seeds.length < numColors && seeds.length < candidates.length) {
+    let bestI = -1;
+    let bestScore = -1;
+    for (let i = 0; i < candidates.length; i++) {
+      let minDist = Infinity;
+      for (const s of seeds) {
+        const dr = candidates[i].r - s.r;
+        const dg = candidates[i].g - s.g;
+        const db = candidates[i].b - s.b;
+        const d = dr * dr + dg * dg + db * db;
+        if (d < minDist) minDist = d;
+      }
+      const score = minDist * candidates[i].count;
+      if (score > bestScore) {
+        bestScore = score;
+        bestI = i;
+      }
+    }
+    if (bestI < 0) break;
+    seeds.push({ ...candidates[bestI] });
+  }
+
+  return seeds.map((s) => ({ r: s.r, g: s.g, b: s.b, a: 255 }));
+}
+
+/** 3×3 binary dilation: output pixel is 1 if any 3×3 neighbor is 1. */
+function dilate3(mask: Uint8Array, width: number, height: number): Uint8Array {
+  const out = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (mask[i]) {
+        out[i] = 1;
+        continue;
+      }
+      let hit = 0;
+      for (let dy = -1; dy <= 1 && !hit; dy++) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= height) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) continue;
+          if (mask[ny * width + nx]) {
+            hit = 1;
+            break;
+          }
+        }
+      }
+      out[i] = hit;
+    }
+  }
+  return out;
+}
+
+/** 3×3 binary erosion: output pixel is 1 only if all 3×3 neighbors are 1. */
+function erode3(mask: Uint8Array, width: number, height: number): Uint8Array {
+  const out = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (!mask[i]) continue;
+      let allOne = 1;
+      for (let dy = -1; dy <= 1 && allOne; dy++) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= height) {
+          allOne = 0;
+          break;
+        }
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= width) {
+            allOne = 0;
+            break;
+          }
+          if (!mask[ny * width + nx]) {
+            allOne = 0;
+            break;
+          }
+        }
+      }
+      out[i] = allOne;
+    }
+  }
+  return out;
+}
+
+/** Morphological close (dilate→erode) — rounds pixel-level jaggies and fills
+ *  single-pixel gaps without significantly changing region area. */
+function smoothMask(mask: Uint8Array, width: number, height: number): Uint8Array {
+  return erode3(dilate3(mask, width, height), width, height);
+}
+
+/**
  * Quantize a raster image into N distinct-color regions using imagetracerjs's
  * color quantization (k-means with selective Gaussian blur preprocessing,
  * which strips anti-aliasing gradients at region edges). Returns the palette
@@ -39,12 +180,13 @@ export function vectorize(
 ): VectorizeResult {
   const imgd = { data, width, height };
 
+  const seedPalette = kmeansPPSeed(data, width, height, numColors);
+
   const quant = ImageTracer.colorquantization(imgd, {
-    numberofcolors: numColors + 1,
-    colorsampling: 2,
-    colorquantcycles: 3,
+    pal: seedPalette,
+    colorquantcycles: 4,
     mincolorratio: 0.0005,
-    blurradius: 5,
+    blurradius: 3,
     blurdelta: 20,
   });
 
@@ -87,11 +229,16 @@ export function vectorize(
   kept.sort((a, b) => b.pal.pixelCount - a.pal.pixelCount);
   const trimmed = kept.slice(0, numColors);
 
+  const smoothed = trimmed.map((e) => ({
+    pal: e.pal,
+    mask: smoothMask(e.mask, width, height),
+  }));
+
   return {
     width,
     height,
-    palette: trimmed.map((e) => e.pal),
-    masks: trimmed.map((e) => e.mask),
+    palette: smoothed.map((e) => e.pal),
+    masks: smoothed.map((e) => e.mask),
   };
 }
 

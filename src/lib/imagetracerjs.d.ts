@@ -12,6 +12,7 @@ declare module "imagetracerjs" {
         mincolorratio?: number;
         blurradius?: number;
         blurdelta?: number;
+        pal?: Palette[];
       },
     ) => QuantResult;
   };

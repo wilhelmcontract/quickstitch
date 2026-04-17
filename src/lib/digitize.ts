@@ -360,14 +360,12 @@ function generateRunningFromSkeleton(
   polylines: { x: number; y: number }[][],
   pxPerMm: number,
   density: number,
-): Stitch[] {
+): Stitch[][] {
   const stepPx = (RUN_STITCH_LEN_MM / Math.max(0.1, density)) * pxPerMm;
-  const out: Stitch[] = [];
-  for (const poly of polylines) {
+  return polylines.map((poly) => {
     const samples = sampleAlong(poly, stepPx);
-    for (const s of samples) out.push(ptMm(s.x, s.y, pxPerMm));
-  }
-  return out;
+    return samples.map((s) => ptMm(s.x, s.y, pxPerMm));
+  });
 }
 
 function principalAngle(pixels: number[], width: number): number {
@@ -533,7 +531,7 @@ function generateSkeletonSatin(
   pxPerMm: number,
   density: number,
   pullCompMm: number,
-): { underlay: Stitch[]; top: Stitch[] } {
+): Array<{ underlay: Stitch[]; top: Stitch[] }> {
   const spacingPx = (SATIN_SPACING_MM / Math.max(0.1, density)) * pxPerMm;
   const pullCompPx = pullCompMm * pxPerMm;
 
@@ -542,7 +540,7 @@ function generateSkeletonSatin(
   const smoothedPolys = traceSkeleton(skel, crop.cw, crop.ch)
     .filter((p) => p.length >= 3)
     .map((p) => smoothPoly(smoothPoly(p, 6), 6));
-  if (smoothedPolys.length === 0) return { underlay: [], top: [] };
+  if (smoothedPolys.length === 0) return [];
 
   const insideLocal = (lx: number, ly: number): boolean => {
     const ix = Math.floor(lx);
@@ -569,15 +567,14 @@ function generateSkeletonSatin(
     return d;
   };
 
-  // Process EVERY skeleton polyline, not just the longest — shapes with
-  // branches (e.g. a shield's pointed bottom meeting the ring body) trace
-  // into multiple polylines and dropping any of them leaves part of the
-  // outline un-stitched.
-  const top: Stitch[] = [];
-  const underlay: Stitch[] = [];
+  // One sub-path per skeleton polyline. The caller emits each as a separate
+  // region so the DST converter inserts a jump between polylines instead of
+  // drawing a visible stitch across the shape interior.
   const edgeWalkStepPx = 2.0 * pxPerMm;
+  const paths: Array<{ underlay: Stitch[]; top: Stitch[] }> = [];
 
   for (const poly of smoothedPolys) {
+    const top: Stitch[] = [];
     let toggle = false;
     for (const s of sampleAlong(poly, spacingPx)) {
       if (!insideLocal(s.x, s.y)) continue;
@@ -599,14 +596,19 @@ function generateSkeletonSatin(
       toggle = !toggle;
     }
 
+    const underlay: Stitch[] = [];
     for (const s of sampleAlong(poly, edgeWalkStepPx)) {
       const gx = s.x + crop.cx;
       const gy = s.y + crop.cy;
       underlay.push(ptMm(gx, gy, pxPerMm));
     }
+
+    if (top.length > 0 || underlay.length > 0) {
+      paths.push({ underlay, top });
+    }
   }
 
-  return { underlay, top };
+  return paths;
 }
 
 function generateSplitSatin(
@@ -840,8 +842,7 @@ export function digitize(
       const maxThicknessMm = (maxD * 2) / pxPerMm;
       const type = classifyByThickness(maxThicknessMm, color.splitWideSatin);
 
-      let underlay: Stitch[] = [];
-      let top: Stitch[] = [];
+      let paths: Array<{ underlay: Stitch[]; top: Stitch[] }>;
       let stitchType: StitchType;
 
       if (type === "running") {
@@ -851,10 +852,14 @@ export function digitize(
         const polylines = localPolys.map((poly) =>
           poly.map((p) => ({ x: p.x + crop.cx, y: p.y + crop.cy })),
         );
-        top = generateRunningFromSkeleton(polylines, pxPerMm, color.density);
+        paths = generateRunningFromSkeleton(
+          polylines,
+          pxPerMm,
+          color.density,
+        ).map((top) => ({ underlay: [], top }));
         stitchType = "running";
       } else if (type === "satin") {
-        const r = generateSkeletonSatin(
+        paths = generateSkeletonSatin(
           pixels,
           width,
           height,
@@ -862,8 +867,6 @@ export function digitize(
           color.density,
           color.pullCompMm,
         );
-        underlay = r.underlay;
-        top = r.top;
         stitchType = "satin";
       } else if (type === "split-satin") {
         const r = generateSplitSatin(
@@ -874,8 +877,7 @@ export function digitize(
           color.pullCompMm,
           SATIN_LANE_WIDTH_MM,
         );
-        underlay = r.underlay;
-        top = r.top;
+        paths = [{ underlay: r.underlay, top: r.top }];
         stitchType = "satin";
       } else {
         const r = generateFill(
@@ -885,24 +887,34 @@ export function digitize(
           color.density,
           color.pullCompMm,
         );
-        underlay = r.underlay;
-        top = r.top;
+        paths = [{ underlay: r.underlay, top: r.top }];
         stitchType = "fill";
       }
 
-      for (const s of underlay) {
-        s.x -= offsetXMm;
-        s.y -= offsetYMm;
+      // One region per sub-path. Skeleton-based generators split into
+      // multiple polylines for shapes with branches (ring body + point tip);
+      // emitting each as its own region means digitizeResultToDst inserts a
+      // jump between them rather than drawing a stitch across the interior.
+      for (const p of paths) {
+        for (const s of p.underlay) {
+          s.x -= offsetXMm;
+          s.y -= offsetYMm;
+        }
+        for (const s of p.top) {
+          s.x -= offsetXMm;
+          s.y -= offsetYMm;
+        }
+        const count = p.underlay.length + p.top.length;
+        if (count === 0) continue;
+        total += count;
+        perColorStitchCount[ci] += count;
+        regions.push({
+          colorIndex: ci,
+          stitchType,
+          underlay: p.underlay,
+          topStitches: p.top,
+        });
       }
-      for (const s of top) {
-        s.x -= offsetXMm;
-        s.y -= offsetYMm;
-      }
-
-      const count = underlay.length + top.length;
-      total += count;
-      perColorStitchCount[ci] += count;
-      regions.push({ colorIndex: ci, stitchType, underlay, topStitches: top });
     }
   }
 

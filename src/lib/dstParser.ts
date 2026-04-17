@@ -219,10 +219,22 @@ export function drawRealisticStitch(
   const rgb = hexToRgb(color);
   if (!rgb) return;
 
-  const dx = x - prevX;
-  const dy = y - prevY;
-  const length = Math.sqrt(dx * dx + dy * dy);
+  const fullDx = x - prevX;
+  const fullDy = y - prevY;
+  const length = Math.sqrt(fullDx * fullDx + fullDy * fullDy);
   if (length < 0.5) return;
+
+  // Shorten each drawn segment so consecutive collinear stitches leave a
+  // visible seam at the needle-down point. Without this, fill stitches merge
+  // into one continuous band and the tatami pattern disappears.
+  const shortenPx = Math.min(threadWidth * 0.5, length * 0.35);
+  const shortenRatio = shortenPx / length;
+  const sx = prevX + fullDx * shortenRatio;
+  const sy = prevY + fullDy * shortenRatio;
+  const ex = x - fullDx * shortenRatio;
+  const ey = y - fullDy * shortenRatio;
+  const dx = ex - sx;
+  const dy = ey - sy;
 
   const angle = Math.atan2(dy, dx);
   const perpX = -Math.sin(angle);
@@ -232,10 +244,10 @@ export function drawRealisticStitch(
   const lightFacing = 0.5 + 0.5 * Math.cos(angle - lightAngleRad + Math.PI / 2);
 
   const perpGradient = ctx.createLinearGradient(
-    prevX + perpX * halfWidth,
-    prevY + perpY * halfWidth,
-    prevX - perpX * halfWidth,
-    prevY - perpY * halfWidth,
+    sx + perpX * halfWidth,
+    sy + perpY * halfWidth,
+    sx - perpX * halfWidth,
+    sy - perpY * halfWidth,
   );
   const darkEdge = adjustBrightness(rgb, 0.82);
   const lightCenter = adjustBrightness(rgb, 1.08 + lightFacing * 0.04);
@@ -248,14 +260,14 @@ export function drawRealisticStitch(
 
   ctx.strokeStyle = perpGradient;
   ctx.lineWidth = threadWidth;
-  ctx.lineCap = "round";
+  ctx.lineCap = "butt";
   ctx.lineJoin = "round";
   ctx.beginPath();
-  ctx.moveTo(prevX, prevY);
-  ctx.lineTo(x, y);
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(ex, ey);
   ctx.stroke();
 
-  const alongGradient = ctx.createLinearGradient(prevX, prevY, x, y);
+  const alongGradient = ctx.createLinearGradient(sx, sy, ex, ey);
   alongGradient.addColorStop(0, "rgba(0,0,0,0.25)");
   alongGradient.addColorStop(0.2, "rgba(0,0,0,0.06)");
   alongGradient.addColorStop(0.5, "rgba(255,255,255,0.12)");
@@ -264,22 +276,22 @@ export function drawRealisticStitch(
 
   ctx.strokeStyle = alongGradient;
   ctx.lineWidth = threadWidth;
-  ctx.lineCap = "round";
+  ctx.lineCap = "butt";
   ctx.beginPath();
-  ctx.moveTo(prevX, prevY);
-  ctx.lineTo(x, y);
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(ex, ey);
   ctx.stroke();
 
   const highlightOffset = -threadWidth * 0.15;
   ctx.strokeStyle = `rgba(255,255,255,${0.15 + 0.1 * lightFacing})`;
   ctx.lineWidth = threadWidth * 0.3;
-  ctx.lineCap = "round";
+  ctx.lineCap = "butt";
   ctx.beginPath();
   ctx.moveTo(
-    prevX + perpX * highlightOffset,
-    prevY + perpY * highlightOffset,
+    sx + perpX * highlightOffset,
+    sy + perpY * highlightOffset,
   );
-  ctx.lineTo(x + perpX * highlightOffset, y + perpY * highlightOffset);
+  ctx.lineTo(ex + perpX * highlightOffset, ey + perpY * highlightOffset);
   ctx.stroke();
 }
 

@@ -793,6 +793,18 @@ function generateFill(
 
   const rowSpacingPx = (FILL_ROW_SPACING_MM / Math.max(0.1, density)) * pxPerMm;
   const stitchLenPx = FILL_STITCH_LEN_MM * pxPerMm;
+  const minStitchPx = 0.3 * pxPerMm;
+
+  // Global s-range so stagger anchors to a single grid across every row.
+  // Without this, each row's stitch endpoints align to its own sStart/sEnd,
+  // producing a random alignment that doesn't read as a tatami brick pattern.
+  let sMinAll = Infinity;
+  let sMaxAll = -Infinity;
+  for (let b = 0; b < prof.sMinByT.length; b++) {
+    if (prof.sMinByT[b] < sMinAll) sMinAll = prof.sMinByT[b];
+    if (prof.sMaxByT[b] > sMaxAll) sMaxAll = prof.sMaxByT[b];
+  }
+  const anchorS = Math.floor(sMinAll / stitchLenPx) * stitchLenPx;
 
   const top: Stitch[] = [];
   let rowIdx = 0;
@@ -804,22 +816,30 @@ function generateFill(
     }
     const sStart = sMin - pullCompPx;
     const sEnd = sMax + pullCompPx;
-    // Tatami offset: shift each row by 1/4 stitch length × row index (mod 4)
-    // so no two adjacent rows start at the same point.
-    const offset = (rowIdx % 4) * (stitchLenPx / 4);
-    const reverse = rowIdx % 2 === 1;
-    if (reverse) {
-      for (let s = sEnd - offset; s >= sStart - 1e-6; s -= stitchLenPx) {
-        const px = prof.cx + t * prof.cosA + s * -prof.sinA;
-        const py = prof.cy + t * prof.sinA + s * prof.cosA;
-        top.push(ptMm(px, py, pxPerMm));
-      }
+    // Classic tatami: odd rows shift by half a stitch length on the shared grid.
+    const rowAnchor = anchorS + (rowIdx % 2 === 1 ? stitchLenPx / 2 : 0);
+
+    const k0 = Math.ceil((sStart - rowAnchor) / stitchLenPx);
+    const k1 = Math.floor((sEnd - rowAnchor) / stitchLenPx);
+    const pts: number[] = [];
+    if (k0 > k1) {
+      if (sEnd - sStart >= minStitchPx) pts.push(sStart, sEnd);
     } else {
-      for (let s = sStart + offset; s <= sEnd + 1e-6; s += stitchLenPx) {
-        const px = prof.cx + t * prof.cosA + s * -prof.sinA;
-        const py = prof.cy + t * prof.sinA + s * prof.cosA;
-        top.push(ptMm(px, py, pxPerMm));
-      }
+      const firstGrid = rowAnchor + k0 * stitchLenPx;
+      const lastGrid = rowAnchor + k1 * stitchLenPx;
+      if (firstGrid - sStart >= minStitchPx) pts.push(sStart);
+      for (let k = k0; k <= k1; k++) pts.push(rowAnchor + k * stitchLenPx);
+      if (sEnd - lastGrid >= minStitchPx) pts.push(sEnd);
+    }
+    if (pts.length < 2) {
+      rowIdx++;
+      continue;
+    }
+    if (rowIdx % 2 === 1) pts.reverse();
+    for (const s of pts) {
+      const px = prof.cx + t * prof.cosA + s * -prof.sinA;
+      const py = prof.cy + t * prof.sinA + s * prof.cosA;
+      top.push(ptMm(px, py, pxPerMm));
     }
     rowIdx++;
   }

@@ -2,6 +2,7 @@
 
 import {
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -314,9 +315,10 @@ export function Estimator() {
     renderDstRealistic(parseResult, threadColors, canvas);
   }, [kind, digitized, colorPlans]);
 
-  // Draw the posterized processed bitmap onto its canvas whenever the prep
-  // modal is open (the modal mounts the canvas).
-  useEffect(() => {
+  // Draw the posterized processed bitmap. useLayoutEffect runs synchronously
+  // after DOM mutations so the ref is guaranteed to be attached (including
+  // after a key-driven remount below).
+  useLayoutEffect(() => {
     if (!prepOpen || !processedRgba || !maskDims) return;
     const canvas = processedCanvasRef.current;
     if (!canvas) return;
@@ -709,6 +711,7 @@ export function Estimator() {
                 </p>
                 <div className="flex items-center justify-center rounded-md border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950 p-3 h-[320px]">
                   <canvas
+                    key={`proc-${colorPlans.length}-${maskDims?.w ?? 0}x${maskDims?.h ?? 0}`}
                     ref={processedCanvasRef}
                     className="max-h-full max-w-full object-contain"
                   />
@@ -733,7 +736,7 @@ export function Estimator() {
                 </span>
               </label>
               <span className="text-xs text-zinc-500">
-                {colorPlans.length} colors — combine similar ones below
+                {colorPlans.length} colors detected
               </span>
             </div>
 

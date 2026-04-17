@@ -106,6 +106,7 @@ export function Estimator() {
   const [prepOpen, setPrepOpen] = useState(false);
   const [accepted, setAccepted] = useState(false);
   const [detailLevel, setDetailLevel] = useState(DEFAULT_DETAIL);
+  const [locateOn, setLocateOn] = useState(false);
   const processedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [selectedForMerge, setSelectedForMerge] = useState<Set<number>>(
     new Set(),
@@ -165,10 +166,14 @@ export function Estimator() {
 
   // Posterized "Processed Bitmap" — each pixel painted with its assigned
   // palette color. Derived so combine/exclude changes update immediately.
+  // When locateOn is true, only pixels belonging to currently-selected
+  // swatches are painted; the rest stay transparent so the user can see
+  // exactly which regions belong to the selection.
   const processedRgba = useMemo<Uint8ClampedArray | null>(() => {
     if (!maskDims || colorMasks.length !== colorPlans.length) return null;
     const rgba = new Uint8ClampedArray(maskDims.w * maskDims.h * 4);
     for (let p = 0; p < colorMasks.length; p++) {
+      if (locateOn && !selectedForMerge.has(p)) continue;
       const { r, g, b } = colorPlans[p];
       const mask = colorMasks[p];
       for (let i = 0; i < mask.length; i++) {
@@ -181,7 +186,7 @@ export function Estimator() {
       }
     }
     return rgba;
-  }, [colorMasks, colorPlans, maskDims]);
+  }, [colorMasks, colorPlans, maskDims, locateOn, selectedForMerge]);
 
   function onDetailChange(d: number) {
     setDetailLevel(d);
@@ -248,6 +253,7 @@ export function Estimator() {
         .filter((_, i) => !drop.has(i)),
     );
     setSelectedForMerge(new Set());
+    setLocateOn(false);
   }
 
   function toggleMergeSelection(i: number) {
@@ -265,6 +271,7 @@ export function Estimator() {
     setColorPlans(colorPlans.filter((_, i) => !drop.has(i)));
     setColorMasks(colorMasks.filter((_, i) => !drop.has(i)));
     setSelectedForMerge(new Set());
+    setLocateOn(false);
   }
 
   const digitized = useMemo<DigitizeResult | null>(() => {
@@ -729,6 +736,18 @@ export function Estimator() {
                     Swatches · {selectedForMerge.size} selected
                   </p>
                   <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setLocateOn((v) => !v)}
+                      disabled={!locateOn && selectedForMerge.size < 1}
+                      className={`rounded-md px-3 py-1 text-xs font-medium disabled:opacity-40 ${
+                        locateOn
+                          ? "bg-blue-600 text-white hover:bg-blue-500"
+                          : "border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                      }`}
+                    >
+                      {locateOn ? "Show all" : "Locate"}
+                    </button>
                     <button
                       type="button"
                       onClick={removeSelected}

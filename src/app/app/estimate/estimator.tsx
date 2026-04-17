@@ -259,6 +259,14 @@ export function Estimator() {
     });
   }
 
+  function removeSelected() {
+    if (selectedForMerge.size === 0) return;
+    const drop = selectedForMerge;
+    setColorPlans(colorPlans.filter((_, i) => !drop.has(i)));
+    setColorMasks(colorMasks.filter((_, i) => !drop.has(i)));
+    setSelectedForMerge(new Set());
+  }
+
   const digitized = useMemo<DigitizeResult | null>(() => {
     if (
       kind !== "image" ||
@@ -400,12 +408,6 @@ export function Estimator() {
           setParseError(msg);
         });
     }
-  }
-
-  function updateColorPlan(idx: number, patch: Partial<ColorPlan>) {
-    setColorPlans((prev) =>
-      prev.map((c, i) => (i === idx ? { ...c, ...patch } : c)),
-    );
   }
 
   function toggleDstStop(idx: number) {
@@ -721,14 +723,57 @@ export function Estimator() {
             </div>
 
             {colorPlans.length > 0 && (
-              <ImageColorList
-                plans={colorPlans}
-                onUpdate={updateColorPlan}
-                stitchCounts={colorPlans.map((p) => p.pixelCount)}
-                selected={selectedForMerge}
-                onToggleSelected={toggleMergeSelection}
-                onCombine={combineSelected}
-              />
+              <div className="mt-4">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-sm font-medium">
+                    Swatches · {selectedForMerge.size} selected
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={removeSelected}
+                      disabled={selectedForMerge.size < 1}
+                      className="rounded-md border border-zinc-300 dark:border-zinc-700 px-3 py-1 text-xs font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-40"
+                    >
+                      Remove
+                    </button>
+                    <button
+                      type="button"
+                      onClick={combineSelected}
+                      disabled={selectedForMerge.size < 2}
+                      className="rounded-md border border-zinc-300 dark:border-zinc-700 px-3 py-1 text-xs font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-40"
+                    >
+                      Combine
+                    </button>
+                  </div>
+                </div>
+                <div className="grid gap-2 [grid-template-columns:repeat(auto-fill,minmax(72px,1fr))]">
+                  {colorPlans.map((c, idx) => {
+                    const sel = selectedForMerge.has(idx);
+                    return (
+                      <button
+                        key={`${c.hex}-${idx}`}
+                        type="button"
+                        onClick={() => toggleMergeSelection(idx)}
+                        title={`${c.hex} · ${c.pixelCount.toLocaleString()} px`}
+                        className={`flex aspect-square flex-col items-center justify-end rounded-md border-2 p-1 text-[10px] font-mono transition ${
+                          sel
+                            ? "border-blue-500 ring-2 ring-blue-400"
+                            : "border-zinc-300 dark:border-zinc-700 hover:border-zinc-400 dark:hover:border-zinc-500"
+                        }`}
+                        style={{ backgroundColor: c.hex }}
+                      >
+                        <span
+                          className="rounded bg-black/60 px-1 text-white"
+                          style={{ textShadow: "0 0 2px rgba(0,0,0,0.8)" }}
+                        >
+                          {c.hex}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             )}
 
             <div className="mt-6 flex justify-end gap-2">
@@ -749,127 +794,6 @@ export function Estimator() {
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-function ImageColorList({
-  plans,
-  onUpdate,
-  stitchCounts,
-  selected,
-  onToggleSelected,
-  onCombine,
-}: {
-  plans: ColorPlan[];
-  onUpdate: (idx: number, patch: Partial<ColorPlan>) => void;
-  stitchCounts: number[];
-  selected: Set<number>;
-  onToggleSelected: (idx: number) => void;
-  onCombine: () => void;
-}) {
-  return (
-    <div className="mt-6 space-y-3">
-      <div className="flex items-center justify-between">
-        <p className="text-sm font-medium">Colors</p>
-        <button
-          type="button"
-          onClick={onCombine}
-          disabled={selected.size < 2}
-          className="rounded-md border border-zinc-300 dark:border-zinc-700 px-3 py-1 text-xs font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-40"
-        >
-          Combine selected ({selected.size})
-        </button>
-      </div>
-      {plans.map((c, idx) => (
-        <div
-          key={idx}
-          className={`rounded-md border p-3 ${
-            c.excluded
-              ? "border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50 opacity-60"
-              : selected.has(idx)
-                ? "border-blue-500 dark:border-blue-400 ring-1 ring-blue-500"
-                : "border-zinc-300 dark:border-zinc-700"
-          }`}
-        >
-          <div className="flex items-center gap-3">
-            <input
-              type="checkbox"
-              checked={selected.has(idx)}
-              onChange={() => onToggleSelected(idx)}
-              title="Select for combine"
-            />
-            <span
-              className="inline-block h-6 w-6 rounded-sm border border-zinc-300 dark:border-zinc-600"
-              style={{ backgroundColor: c.hex }}
-            />
-            <span className="text-sm font-mono">{c.hex}</span>
-            <span className="ml-auto text-xs text-zinc-500">
-              {stitchCounts[idx].toLocaleString()} stitches
-            </span>
-            <label className="flex items-center gap-1 text-xs">
-              <input
-                type="checkbox"
-                checked={c.excluded}
-                onChange={(e) => onUpdate(idx, { excluded: e.target.checked })}
-              />
-              Off
-            </label>
-          </div>
-          {!c.excluded && (
-            <div className="mt-3 grid gap-3 sm:grid-cols-3">
-              <label className="text-xs">
-                <div className="flex justify-between">
-                  <span>Density</span>
-                  <span className="text-zinc-500">
-                    {c.density.toFixed(2)}×
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={0.5}
-                  max={2}
-                  step={0.05}
-                  value={c.density}
-                  onChange={(e) =>
-                    onUpdate(idx, { density: Number(e.target.value) })
-                  }
-                  className="mt-1 w-full"
-                />
-              </label>
-              <label className="text-xs">
-                <div className="flex justify-between">
-                  <span>Pull comp</span>
-                  <span className="text-zinc-500">
-                    {c.pullCompMm.toFixed(2)} mm
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={c.pullCompMm}
-                  onChange={(e) =>
-                    onUpdate(idx, { pullCompMm: Number(e.target.value) })
-                  }
-                  className="mt-1 w-full"
-                />
-              </label>
-              <label className="flex items-center gap-2 text-xs">
-                <input
-                  type="checkbox"
-                  checked={c.splitWideSatin}
-                  onChange={(e) =>
-                    onUpdate(idx, { splitWideSatin: e.target.checked })
-                  }
-                />
-                <span>Split wide satin (≥6mm)</span>
-              </label>
-            </div>
-          )}
-        </div>
-      ))}
     </div>
   );
 }
